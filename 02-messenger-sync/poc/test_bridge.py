@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 spec = importlib.util.spec_from_file_location('bridge', Path(__file__).with_name('bridge.py'))
 b = importlib.util.module_from_spec(spec)
@@ -28,39 +28,33 @@ class FakeApi:
         self.calls = []
         self.error = error
 
-    def request(self, service, path, **kwargs):
+    async def request(self, service, path, **kwargs):
         self.calls.append((service, path, kwargs))
         if self.error:
             raise self.error
         return {'message': {'body': {'mid': 'copy1'}}} if service == 'max' else {'message_id': 999}
 
-    def prepare_photo(self, *args):
+    async def prepare_photo(self, *args):
         if self.error:
             raise self.error
         return {'token': 'test'}
 
 
-class BridgeTests(unittest.TestCase):
-    def test_telegram_photo_with_generic_mime_is_accepted(self):
+class BridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_photo_with_generic_mime_is_accepted(self):
         api = b.Api.__new__(b.Api)
         api.cfg = {'TG_BOT_TOKEN': 'test'}
-        api.request = MagicMock(return_value={'file_path': 'photos/test.jpg'})
-        api.opener = MagicMock()
-        response = api.opener.open.return_value.__enter__.return_value
-        response.read.return_value = b'\xff\xd8\xfftest-photo'
-        response.headers.get_content_type.return_value = 'application/octet-stream'
-        self.assertEqual(api.download('tg', 'test')[1], 'image/jpeg')
+        api.request = AsyncMock(return_value={'file_path': 'photos/test.jpg'})
+        api.read = AsyncMock(return_value=(200, b'\xff\xd8\xfftest-photo'))
+        self.assertEqual((await api.download('tg', 'test'))[1], 'image/jpeg')
 
-    def test_image_mime_does_not_allow_non_image_content(self):
+    async def test_image_mime_does_not_allow_non_image_content(self):
         api = b.Api.__new__(b.Api)
         api.cfg = {'TG_BOT_TOKEN': 'test'}
-        api.request = MagicMock(return_value={'file_path': 'photos/test.jpg'})
-        api.opener = MagicMock()
-        response = api.opener.open.return_value.__enter__.return_value
-        response.read.return_value = b'<html>error</html>'
-        response.headers.get_content_type.return_value = 'image/jpeg'
+        api.request = AsyncMock(return_value={'file_path': 'photos/test.jpg'})
+        api.read = AsyncMock(return_value=(200, b'<html>error</html>'))
         with self.assertRaises(b.BridgeError):
-            api.download('tg', 'test')
+            await api.download('tg', 'test')
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -77,13 +71,13 @@ class BridgeTests(unittest.TestCase):
     def jobs(self):
         return self.store.db.execute('SELECT * FROM jobs ORDER BY id').fetchall()
 
-    def test_deduplicates_redelivered_event_and_persists_cursor(self):
+    async def test_deduplicates_redelivered_event_and_persists_cursor(self):
         for _ in range(2):
             self.store.accept('tg', [tg()], 2, '-100', '99')
         self.assertEqual(len(self.jobs()), 1)
         self.assertEqual(self.store.get('cursor_tg'), '2')
 
-    def test_only_pending_due_head_can_be_claimed_once(self):
+    async def test_only_pending_due_head_can_be_claimed_once(self):
         self.store.accept('tg', [tg(1), tg(2)], 3, '-100', '99')
         first, second = self.jobs()
         self.assertFalse(self.store.start_sending(second))
@@ -94,22 +88,22 @@ class BridgeTests(unittest.TestCase):
         self.store.update(2, 'pending', delay=60)
         self.assertFalse(self.store.start_sending(second))
 
-    def test_identical_human_messages_are_distinct(self):
+    async def test_identical_human_messages_are_distinct(self):
         self.store.accept('tg', [tg(1), tg(2, author=11)], 3, '-100', '99')
         self.assertEqual(len(self.jobs()), 2)
 
-    def test_own_bot_echo_and_unconfigured_chat_ignored(self):
+    async def test_own_bot_echo_and_unconfigured_chat_ignored(self):
         self.store.accept('tg', [tg(author=99), tg(2, chat=-333)], 3, '-100', '99')
         self.store.accept('max', [mx(author=88), mx('m2', chat=-333)], 3, '-200', '88')
         self.assertEqual(len(self.jobs()), 0)
 
-    def test_other_bot_message_is_not_filtered(self):
+    async def test_other_bot_message_is_not_filtered(self):
         event = tg()
         event['message']['from']['is_bot'] = True
         self.store.accept('tg', [event], 2, '-100', '99')
         self.assertEqual(len(self.jobs()), 1)
 
-    def test_reply_to_copy_maps_back_to_original(self):
+    async def test_reply_to_copy_maps_back_to_original(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'sent', remote_id='copy-in-max')
         event = mx()
@@ -117,7 +111,7 @@ class BridgeTests(unittest.TestCase):
         self.store.accept('max', [event], 2, '-200', '88')
         self.assertEqual(self.store.parent_id(self.jobs()[1]), '1')
 
-    def test_reply_to_native_message_maps_to_mirrored_copy(self):
+    async def test_reply_to_native_message_maps_to_mirrored_copy(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'sent', remote_id='copy-in-max')
         event = tg(2)
@@ -125,7 +119,7 @@ class BridgeTests(unittest.TestCase):
         self.store.accept('tg', [event], 3, '-100', '99')
         self.assertEqual(self.store.parent_id(self.jobs()[1]), 'copy-in-max')
 
-    def test_photo_caption_and_largest_version(self):
+    async def test_photo_caption_and_largest_version(self):
         event = tg(text='')
         event['message']['caption'] = 'Подпись'
         event['message']['photo'] = [{'file_id': 'small', 'file_size': 10}, {'file_id': 'large', 'file_size': 100}]
@@ -134,7 +128,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(part['reference'], 'large')
         self.assertIn('Подпись', part['text'])
 
-    def test_max_multiple_images(self):
+    async def test_max_multiple_images(self):
         event = mx()
         event['message']['body']['attachments'] = [
             {'type': 'image', 'payload': {'url': 'https://i.oneme.ru/1'}},
@@ -142,13 +136,13 @@ class BridgeTests(unittest.TestCase):
         parts = b.units(b.normalize('max', event, '-200', '88'))
         self.assertEqual([p['kind'] for p in parts], ['photo', 'photo'])
 
-    def test_text_split_is_utf16_safe(self):
+    async def test_text_split_is_utf16_safe(self):
         text = '😀' * 4000
         parts = b.split_text(text)
         self.assertEqual(''.join(parts), text)
         self.assertTrue(all(len(p.encode('utf-16-le')) // 2 <= 3500 for p in parts))
 
-    def test_bad_image_is_quarantined_without_blocking_good_events(self):
+    async def test_bad_image_is_quarantined_without_blocking_good_events(self):
         event = mx()
         event['message']['body']['attachments'] = [{'type': 'image', 'payload': {}}]
         for _ in range(2):
@@ -160,7 +154,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(rows[0]['payload']), event)
         self.assertEqual(rows[0]['state'], 'open')
 
-    def test_malformed_selected_fields_are_isolated_but_foreign_chat_is_ignored(self):
+    async def test_malformed_selected_fields_are_isolated_but_foreign_chat_is_ignored(self):
         bad = [mx('bad-text', text=[]), mx('bad-body'), mx('bad-attachment')]
         bad[1]['message']['body'] = ['invalid']
         bad[2]['message']['body']['attachments'] = ['invalid']
@@ -170,7 +164,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(self.jobs()), 1)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 3)
 
-    def test_database_error_rolls_back_jobs_quarantine_and_cursor(self):
+    async def test_database_error_rolls_back_jobs_quarantine_and_cursor(self):
         event = mx('bad', text=[])
         self.store.db.execute("""CREATE TRIGGER fail_cursor BEFORE INSERT ON meta
                                BEGIN SELECT RAISE(ABORT, 'injected'); END""")
@@ -180,13 +174,13 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 0)
         self.assertIsNone(self.store.get('cursor_max'))
 
-    def test_programming_error_is_not_silently_quarantined(self):
+    async def test_programming_error_is_not_silently_quarantined(self):
         with patch.object(b, 'normalize', side_effect=RuntimeError('bug')):
             with self.assertRaises(RuntimeError):
                 self.store.accept('tg', [tg()], 2, '-100', '99')
         self.assertIsNone(self.store.get('cursor_tg'))
 
-    def test_quarantine_survives_restart_and_can_be_reprocessed_once(self):
+    async def test_quarantine_survives_restart_and_can_be_reprocessed_once(self):
         event = mx('bad', text=[])
         self.store.accept('max', [event], 3, '-200', '88')
         self.store.db.close()
@@ -199,7 +193,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(self.jobs()), 1)
         self.assertEqual(self.store.get('cursor_max'), '3')
 
-    def test_legacy_database_is_backed_up_and_migrated_without_losing_jobs(self):
+    async def test_legacy_database_is_backed_up_and_migrated_without_losing_jobs(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'sent', remote_id='old-copy')
         self.store.db.execute('DROP TABLE quarantine')
@@ -211,16 +205,16 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], b.SCHEMA_VERSION)
         self.assertEqual(len(list(Path(self.tmp.name).glob('state.db.v0-*.bak'))), 1)
 
-    def test_failed_retry_is_idempotent_and_unblocks_delivery(self):
+    async def test_failed_retry_is_idempotent_and_unblocks_delivery(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'failed', 'rejected')
         self.store.manage_job(1, 'retry', 'fixed')
         self.store.manage_job(1, 'retry', 'fixed')
-        self.bridge(FakeApi()).deliver('max')
+        await self.bridge(FakeApi()).deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'sent')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 1)
 
-    def test_uncertain_retry_requires_explicit_duplicate_risk(self):
+    async def test_uncertain_retry_requires_explicit_duplicate_risk(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'uncertain')
         with self.assertRaises(b.BridgeError):
@@ -229,7 +223,7 @@ class BridgeTests(unittest.TestCase):
         self.store.manage_job(1, 'retry', 'reviewed', accept_duplicate_risk=True)
         self.assertEqual(self.jobs()[0]['state'], 'pending')
 
-    def test_manual_confirm_is_idempotent_and_restores_reply_mapping(self):
+    async def test_manual_confirm_is_idempotent_and_restores_reply_mapping(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'uncertain')
         for _ in range(2):
@@ -240,7 +234,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.store.parent_id(self.jobs()[1]), '1')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 1)
 
-    def test_confirm_rejects_duplicate_or_invalid_remote_id(self):
+    async def test_confirm_rejects_duplicate_or_invalid_remote_id(self):
         self.store.accept('max', [mx('first'), mx('second')], 3, '-200', '88')
         self.store.update(1, 'sent', remote_id='123')
         self.store.update(2, 'uncertain')
@@ -249,18 +243,18 @@ class BridgeTests(unittest.TestCase):
                 self.store.manage_job(2, 'confirm', 'reviewed', remote_id=remote_id)
         self.assertEqual(self.jobs()[1]['state'], 'uncertain')
 
-    def test_skip_remaining_preserves_sent_prefix_and_other_messages(self):
+    async def test_skip_remaining_preserves_sent_prefix_and_other_messages(self):
         self.store.accept('tg', [tg(1, text='x' * 9000), tg(2)], 3, '-100', '99')
         self.store.update(1, 'sent', remote_id='prefix')
         self.store.update(2, 'failed')
         for _ in range(2):
             self.store.manage_job(2, 'skip', 'approved omission', remaining=True)
         self.assertEqual([j['state'] for j in self.jobs()], ['sent', 'skipped', 'skipped', 'pending'])
-        self.bridge(FakeApi()).deliver('max')
+        await self.bridge(FakeApi()).deliver('max')
         self.assertEqual(self.jobs()[3]['state'], 'sent')
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 2)
 
-    def test_active_or_delivered_job_cannot_be_overwritten(self):
+    async def test_active_or_delivered_job_cannot_be_overwritten(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'sending')
         for action in ('retry', 'skip', 'confirm'):
@@ -270,7 +264,7 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(b.BridgeError):
             self.store.manage_job(1, 'confirm', 'reviewed', remote_id='different-copy')
 
-    def test_audit_write_failure_rolls_back_operator_action(self):
+    async def test_audit_write_failure_rolls_back_operator_action(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'failed')
         self.store.db.execute("""CREATE TRIGGER fail_audit BEFORE INSERT ON audit
@@ -279,7 +273,7 @@ class BridgeTests(unittest.TestCase):
             self.store.manage_job(1, 'retry', 'fixed')
         self.assertEqual(self.jobs()[0]['state'], 'failed')
 
-    def test_cli_maintenance_is_offline_and_never_displays_payload(self):
+    async def test_cli_maintenance_is_offline_and_never_displays_payload(self):
         self.store.accept('tg', [tg(text='PRIVATE_MESSAGE')], 2, '-100', '99')
         self.store.update(1, 'uncertain')
         self.store.db.close()
@@ -293,7 +287,7 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_MESSAGE', output.getvalue())
         self.assertEqual(self.jobs()[0]['state'], 'sent')
 
-    def test_cli_mutation_is_rejected_while_bridge_holds_process_lock(self):
+    async def test_cli_mutation_is_rejected_while_bridge_holds_process_lock(self):
         # Use the CLI's filename so it reaches the lock rather than a missing-DB error.
         path = Path(self.tmp.name) / 'bridge.sqlite3'
         other = b.Store(path)
@@ -302,7 +296,7 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(b.BridgeError, 'Другой процесс'):
                 b.main(['queue', 'skip', '1', '--reason', 'reviewed', '--state-dir', self.tmp.name])
 
-    def test_readonly_legacy_inspection_does_not_migrate_database(self):
+    async def test_readonly_legacy_inspection_does_not_migrate_database(self):
         self.store.db.execute('PRAGMA user_version=0')
         self.store.db.commit()
         reader = b.Store(Path(self.tmp.name) / 'state.db', readonly=True)
@@ -313,7 +307,7 @@ class BridgeTests(unittest.TestCase):
             reader.db.close()
         self.assertEqual(list(Path(self.tmp.name).glob('*.bak')), [])
 
-    def test_cli_quarantine_retry_uses_stored_identity(self):
+    async def test_cli_quarantine_retry_uses_stored_identity(self):
         path = Path(self.tmp.name) / 'bridge.sqlite3'
         other = b.Store(path)
         other.accept('max', [mx(text=[])], 3, '-200', '88')
@@ -329,7 +323,7 @@ class BridgeTests(unittest.TestCase):
         finally:
             other.db.close()
 
-    def test_unknown_media_hosts_rejected(self):
+    async def test_unknown_media_hosts_rejected(self):
         for url in ('http://i.oneme.ru/a', 'https://localhost/a', 'https://oneme.ru.evil.test/a',
                     'https://127.0.0.1/a', 'https://i.oneme.ru:8080/a'):
             with self.assertRaises(b.BridgeError):
@@ -345,36 +339,36 @@ class BridgeTests(unittest.TestCase):
                 self.store.set('last_poll_success_' + platform, now)
                 self.store.set('last_poll_error_' + platform, '')
 
-    def test_empty_queue_is_healthy_after_successful_empty_polls(self):
+    async def test_empty_queue_is_healthy_after_successful_empty_polls(self):
         self.healthy_telemetry()
         snapshot = b.health_snapshot(self.store, now=1000, running=True)
         self.assertTrue(snapshot['ok'])
         self.assertEqual(snapshot['platforms']['tg']['delivery']['counts'], {})
         self.assertIsNone(snapshot['platforms']['max']['delivery']['last_success_at'])
 
-    def test_poll_failure_and_recovery_are_persisted_per_platform(self):
+    async def test_poll_failure_and_recovery_are_persisted_per_platform(self):
         now = b.time.time()
         self.healthy_telemetry(now)
         with self.assertRaises(b.TransportError):
-            self.bridge(FakeApi(b.TransportError('synthetic'))).poll('tg')
+            await self.bridge(FakeApi(b.TransportError('synthetic'))).poll('tg')
         failed = b.health_snapshot(self.store, running=True)
         self.assertEqual([i['key'] for i in failed['issues']], ['poll:tg'])
         api = MagicMock()
-        api.request.return_value = []
-        self.bridge(api).poll('tg')
+        api.request = AsyncMock(return_value=[])
+        await self.bridge(api).poll('tg')
         self.assertTrue(b.health_snapshot(self.store, running=True)['ok'])
 
-    def test_fresh_heartbeat_does_not_hide_stopped_process(self):
+    async def test_fresh_heartbeat_does_not_hide_stopped_process(self):
         self.healthy_telemetry()
         snapshot = b.health_snapshot(self.store, now=1000, running=False)
         self.assertEqual([i['code'] for i in snapshot['issues']], ['process_stopped'])
 
-    def test_stale_heartbeat_and_poll_are_unhealthy_even_with_process_lock(self):
+    async def test_stale_heartbeat_and_poll_are_unhealthy_even_with_process_lock(self):
         self.healthy_telemetry()
         snapshot = b.health_snapshot(self.store, now=1300, running=True, stale_after=180)
         self.assertEqual({i['code'] for i in snapshot['issues']}, {'heartbeat_stale', 'poll_stale'})
 
-    def test_queue_age_and_blocking_job_are_visible_without_payload(self):
+    async def test_queue_age_and_blocking_job_are_visible_without_payload(self):
         self.store.accept('tg', [tg(text='PRIVATE_BODY')], 2, '-100', '99')
         self.store.update(1, 'failed', 'PRIVATE_ERROR')
         with self.store.db:
@@ -385,7 +379,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(snapshot['platforms']['max']['delivery']['oldest_unresolved_age_seconds'], 400)
         self.assertNotIn('PRIVATE', json.dumps(snapshot))
 
-    def test_unknown_legacy_queue_age_is_not_fabricated(self):
+    async def test_unknown_legacy_queue_age_is_not_fabricated(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         with self.store.db:
             self.store.db.execute('UPDATE jobs SET created=NULL,updated=NULL')
@@ -394,7 +388,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([i['code'] for i in snapshot['issues']], ['queue_age_unknown'])
         self.assertIsNone(snapshot['platforms']['max']['delivery']['oldest_pending_age_seconds'])
 
-    def test_actual_old_schema_gains_timestamps_and_preserves_backup(self):
+    async def test_actual_old_schema_gains_timestamps_and_preserves_backup(self):
         path = Path(self.tmp.name) / 'legacy.sqlite3'
         db = sqlite3.connect(path)
         db.executescript('''CREATE TABLE jobs(
@@ -419,13 +413,13 @@ class BridgeTests(unittest.TestCase):
         finally:
             migrated.db.close()
 
-    def test_delivery_success_timestamp_is_recorded_with_sent_job(self):
+    async def test_delivery_success_timestamp_is_recorded_with_sent_job(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
-        self.bridge(FakeApi()).deliver('max')
+        await self.bridge(FakeApi()).deliver('max')
         self.assertIsNotNone(self.store.get('last_delivery_success_max'))
         self.assertIsNone(self.store.get('last_delivery_success_tg'))
 
-    def test_monitor_emits_problem_once_across_restart_and_one_recovery(self):
+    async def test_monitor_emits_problem_once_across_restart_and_one_recovery(self):
         self.healthy_telemetry()
         monitor_path = Path(self.tmp.name) / 'monitor.sqlite3'
         monitor = b.AlertMonitor(monitor_path)
@@ -450,7 +444,7 @@ class BridgeTests(unittest.TestCase):
         finally:
             monitor.db.close()
 
-    def test_monitor_preserves_alert_when_sink_fails(self):
+    async def test_monitor_preserves_alert_when_sink_fails(self):
         path = Path(self.tmp.name) / 'monitor.sqlite3'
         monitor = b.AlertMonitor(path)
         monitor.observe(b.health_snapshot(None, now=1000))
@@ -467,7 +461,7 @@ class BridgeTests(unittest.TestCase):
         finally:
             monitor.db.close()
 
-    def test_unreadable_state_does_not_falsely_resolve_known_problems(self):
+    async def test_unreadable_state_does_not_falsely_resolve_known_problems(self):
         monitor = b.AlertMonitor(':memory:')
         try:
             self.healthy_telemetry()
@@ -485,7 +479,7 @@ class BridgeTests(unittest.TestCase):
         finally:
             monitor.db.close()
 
-    def test_missing_state_health_is_machine_readable_and_nonzero(self):
+    async def test_missing_state_health_is_machine_readable_and_nonzero(self):
         output = io.StringIO()
         with redirect_stdout(output):
             code = b.main(['health', '--json', '--state-dir', str(Path(self.tmp.name) / 'missing')])
@@ -493,7 +487,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())['issues'][0]['code'], 'state_missing')
         self.assertFalse((Path(self.tmp.name) / 'missing').exists())
 
-    def test_monitor_once_is_quiet_on_unchanged_state(self):
+    async def test_monitor_once_is_quiet_on_unchanged_state(self):
         output = io.StringIO()
         with redirect_stdout(output):
             b.main(['monitor', '--once', '--state-dir', self.tmp.name])
@@ -502,63 +496,63 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['kind'], 'problem')
 
-    def test_corrupt_state_is_reported_without_raw_database_error(self):
+    async def test_corrupt_state_is_reported_without_raw_database_error(self):
         path = Path(self.tmp.name) / 'bridge.sqlite3'
         path.write_text('PRIVATE_DATABASE_CONTENT')
         snapshot = b.read_health(Path(self.tmp.name))
         self.assertEqual(snapshot['issues'][0]['code'], 'state_unavailable')
         self.assertNotIn('PRIVATE', json.dumps(snapshot))
 
-    def test_live_process_lock_is_detected_and_released(self):
+    async def test_live_process_lock_is_detected_and_released(self):
         state = Path(self.tmp.name)
         self.assertFalse(b.bridge_running(state))
         with b.process_lock(state):
             self.assertTrue(b.bridge_running(state))
         self.assertFalse(b.bridge_running(state))
 
-    def test_ambiguous_publish_is_not_retried_and_blocks_destination(self):
+    async def test_ambiguous_publish_is_not_retried_and_blocks_destination(self):
         self.store.accept('tg', [tg(1), tg(2)], 3, '-100', '99')
         api = FakeApi(b.TransportError('network'))
         bridge = self.bridge(api)
-        bridge.deliver('max')
+        await bridge.deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'uncertain')
-        bridge.deliver('max')
+        await bridge.deliver('max')
         self.assertEqual(len(api.calls), 1)
 
-    def test_rate_limit_remains_pending(self):
+    async def test_rate_limit_remains_pending(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
-        self.bridge(FakeApi(b.ApiError('max', 429, 10))).deliver('max')
+        await self.bridge(FakeApi(b.ApiError('max', 429, 10))).deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'pending')
         self.assertGreater(self.jobs()[0]['ready'], 0)
 
-    def test_photo_download_failure_safe_to_retry(self):
+    async def test_photo_download_failure_safe_to_retry(self):
         event = tg(text='')
         event['message']['photo'] = [{'file_id': 'image'}]
         self.store.accept('tg', [event], 2, '-100', '99')
-        self.bridge(FakeApi(b.TransportError('download failed'))).deliver('max')
+        await self.bridge(FakeApi(b.TransportError('download failed'))).deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'pending')
 
-    def test_prepublication_server_failure_safe_to_retry(self):
+    async def test_prepublication_server_failure_safe_to_retry(self):
         event = tg(text='')
         event['message']['photo'] = [{'file_id': 'image'}]
         self.store.accept('tg', [event], 2, '-100', '99')
-        self.bridge(FakeApi(b.ApiError('tg', 503))).deliver('max')
+        await self.bridge(FakeApi(b.ApiError('tg', 503))).deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'pending')
 
-    def test_publication_server_failure_is_uncertain(self):
+    async def test_publication_server_failure_is_uncertain(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
-        self.bridge(FakeApi(b.ApiError('max', 503))).deliver('max')
+        await self.bridge(FakeApi(b.ApiError('max', 503))).deliver('max')
         self.assertEqual(self.jobs()[0]['state'], 'uncertain')
 
-    def test_crash_during_publish_becomes_uncertain_on_restart(self):
+    async def test_crash_during_publish_becomes_uncertain_on_restart(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
         self.store.update(1, 'sending')
         self.store.recover()
         self.assertEqual(self.jobs()[0]['state'], 'uncertain')
 
-    def test_successful_copy_is_recorded(self):
+    async def test_successful_copy_is_recorded(self):
         self.store.accept('tg', [tg()], 2, '-100', '99')
-        self.bridge(FakeApi()).deliver('max')
+        await self.bridge(FakeApi()).deliver('max')
         self.assertEqual(self.jobs()[0]['remote_id'], 'copy1')
         self.assertEqual(self.jobs()[0]['state'], 'sent')
 

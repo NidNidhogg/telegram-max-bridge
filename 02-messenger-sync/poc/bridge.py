@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Telegram/MAX test bridge. Standard library only; no production service."""
+"""Async Telegram/MAX test bridge with durable SQLite delivery; polling is test-only."""
 from __future__ import annotations
 
 import argparse
@@ -18,9 +18,7 @@ import sqlite3
 import ssl
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 import aiohttp
 
@@ -127,15 +125,6 @@ def config(require_chats=False):
     return values
 
 
-class SafeRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        check_media_url(newurl)
-        # Never forward authorization headers to a redirect target.
-        if req.get_method() != 'GET':
-            raise BridgeError('Перенаправление загрузки требует проверки')
-        return urllib.request.Request(newurl, headers={'User-Agent': 'messenger-sync-poc/1'})
-
-
 def check_media_url(url):
     parsed = urllib.parse.urlsplit(url)
     host = (parsed.hostname or '').lower()
@@ -160,127 +149,6 @@ def multipart(fields, field, data, filename, mime):
 
 
 class Api:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        ctx = ssl.create_default_context()
-        self.opener = urllib.request.build_opener(
-            SafeRedirect(), urllib.request.HTTPSHandler(context=ctx))
-        max_ctx = ssl.create_default_context()
-        if cfg.get('MAX_CA_FILE'):
-            ca_path = Path(cfg['MAX_CA_FILE'])
-            if not ca_path.is_absolute():
-                ca_path = ROOT / ca_path
-            max_ctx.load_verify_locations(cafile=str(ca_path))
-        # Additional MAX trust is scoped to MAX requests; Telegram keeps default roots.
-        self.max_opener = urllib.request.build_opener(
-            SafeRedirect(), urllib.request.HTTPSHandler(context=max_ctx))
-
-    def request(self, service, path, method='GET', query=None, body=None, upload=None):
-        if service == 'tg':
-            url = 'https://api.telegram.org/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + path
-            headers = {}
-        elif service == 'max':
-            url = MAX_API + path
-            headers = {'Authorization': self.cfg['MAX_BOT_TOKEN']}
-        else:
-            check_media_url(path)
-            url, headers = path, {}
-        if query:
-            url += '?' + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
-        if upload:
-            data, mime = upload
-            headers['Content-Type'] = mime
-        elif body is not None:
-            data = json.dumps(body, ensure_ascii=False).encode()
-            headers['Content-Type'] = 'application/json'
-        else:
-            data = None
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            opener = self.opener if service == 'tg' else self.max_opener
-            with opener.open(req, timeout=25) as response:
-                raw = response.read(2 * 1024 * 1024 + 1)
-                if len(raw) > 2 * 1024 * 1024:
-                    raise TransportError('Слишком большой ответ API')
-        except urllib.error.HTTPError as exc:
-            # Response descriptions/URLs can contain tokens. Never include them in errors.
-            try:
-                err = json.loads(exc.read(65536))
-            except (ValueError, OSError):
-                err = {}
-            code = err.get('error_code', err.get('code', exc.code))
-            if not isinstance(code, (str, int)) or len(str(code)) > 64:
-                code = exc.code
-            # Only documented machine codes or numeric status codes reach logs.
-            if str(code) not in ('attachment.not.ready',) and not str(code).isdigit():
-                code = exc.code
-            retry = err.get('parameters', {}).get('retry_after', 0)
-            raise ApiError(service, code, retry) from None
-        except (OSError, urllib.error.URLError, TimeoutError):
-            raise TransportError(f'{service}: ошибка соединения или TLS') from None
-        try:
-            result = json.loads(raw)
-        except ValueError:
-            raise TransportError(f'{service}: не удалось разобрать ответ API') from None
-        if not isinstance(result, dict):
-            raise TransportError(f'{service}: неожиданный формат ответа')
-        if service == 'tg':
-            if not result.get('ok'):
-                raise ApiError(service, result.get('error_code', 400),
-                               result.get('parameters', {}).get('retry_after', 0))
-            return result['result']
-        return result
-
-    def download(self, platform, reference):
-        if platform == 'tg':
-            info = self.request('tg', 'getFile', query={'file_id': reference})
-            if info.get('file_size', 0) > PHOTO_LIMIT:
-                raise BridgeError('Картинка превышает предел PoC 10 MiB')
-            file_path = info.get('file_path', '')
-            if not file_path or '..' in file_path.split('/'):
-                raise BridgeError('Не получен безопасный путь картинки Telegram')
-            url = 'https://api.telegram.org/file/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + file_path
-        else:
-            url = reference
-            check_media_url(url)
-        try:
-            opener = self.opener if platform == 'tg' else self.max_opener
-            with opener.open(url, timeout=25) as response:
-                data = response.read(PHOTO_LIMIT + 1)
-                mime = response.headers.get_content_type()
-        except (OSError, urllib.error.URLError, TimeoutError):
-            raise TransportError('Не удалось скачать картинку') from None
-        if len(data) > PHOTO_LIMIT:
-            raise BridgeError('Картинка превышает предел PoC 10 MiB')
-        # Telegram's file server may return application/octet-stream for photos.
-        # Recognize supported image signatures rather than trusting that header.
-        if data.startswith(b'\xff\xd8\xff'):
-            mime = 'image/jpeg'
-        elif data.startswith(b'\x89PNG\r\n\x1a\n'):
-            mime = 'image/png'
-        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
-            mime = 'image/webp'
-        else:
-            raise BridgeError('Для PoC поддерживаются картинки JPEG, PNG и WEBP')
-        return data, mime
-
-    def prepare_photo(self, source, reference, destination):
-        data, mime = self.download(source, reference)
-        filename = 'image' + (mimetypes.guess_extension(mime) or '.jpg')
-        if destination == 'tg':
-            return data, mime, filename
-        endpoint = self.request('max', '/uploads', method='POST', query={'type': 'image'})
-        uploaded = self.request('media', endpoint['url'], method='POST',
-                                upload=multipart({}, 'data', data, filename, mime))
-        if uploaded.get('photos'):
-            return {'photos': uploaded['photos']}
-        token = uploaded.get('token') or endpoint.get('token')
-        if token:
-            return {'token': token}
-        raise BridgeError('Ответ загрузки MAX не содержит токен картинки')
-
-
-class AsyncApi:
     """Bounded async transport; publication is never retried by this adapter."""
     def __init__(self, cfg, *, tg_base=None, max_base=None, timeout=None):
         self.cfg = cfg
@@ -523,7 +391,7 @@ def units(message):
 
 class Store:
     def __init__(self, path, readonly=False):
-        self.db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True) if readonly else sqlite3.connect(path)
+        self.db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True) if readonly else sqlite3.connect(path, timeout=0.1)
         try:
             self.initialize(path, readonly)
         except BaseException:
@@ -809,19 +677,21 @@ def publication(destination, target, part, parent, photo):
 
 
 class Bridge:
-    def __init__(self, cfg, api, store, ids):
+    def __init__(self, cfg, api, store, ids, *, send_intervals=None):
         self.cfg, self.api, self.store, self.ids = cfg, api, store, ids
+        self.paused = set()
+        self.send_intervals = {'tg': 3.2, 'max': 0.6} if send_intervals is None else send_intervals
 
-    def poll(self, platform):
+    async def poll(self, platform):
         try:
             cursor = self.store.get('cursor_' + platform)
             if platform == 'tg':
-                events = self.api.request('tg', 'getUpdates', method='POST', body={
+                events = await self.api.request('tg', 'getUpdates', method='POST', body={
                     'offset': int(cursor) if cursor is not None else None,
                     'timeout': 0, 'allowed_updates': ['message']})
                 next_cursor = max(e['update_id'] for e in events) + 1 if events else cursor
             else:
-                result = self.api.request('max', '/updates', query={
+                result = await self.api.request('max', '/updates', query={
                     'marker': cursor, 'timeout': 0, 'types': 'message_created', 'limit': 100})
                 events, next_cursor = result.get('updates', []), result.get('marker')
             self.store.accept(platform, events, next_cursor, self.cfg[platform.upper() + '_CHAT_ID'], self.ids[platform])
@@ -829,7 +699,7 @@ class Bridge:
             self.store.poll_failure(platform, exc)
             raise
 
-    def deliver(self, destination):
+    async def deliver(self, destination, stop=None):
         # Keep ordering; uncertain/failed publication blocks this destination until reviewed.
         job = self.store.db.execute("SELECT * FROM jobs WHERE destination=? AND state NOT IN ('sent','skipped') ORDER BY id LIMIT 1",
                                     (destination,)).fetchone()
@@ -839,20 +709,33 @@ class Bridge:
         if time.time() < next_send:
             return
         part = json.loads(job['payload'])
+        if destination in self.paused or (part['kind'] == 'photo' and job['source'] in self.paused):
+            return
         target = self.cfg[destination.upper() + '_CHAT_ID']
         parent = self.store.parent_id(job) if job['part'] == 0 else None
         publishing = False
         try:
-            photo = self.api.prepare_photo(job['source'], part['reference'], destination) if part['kind'] == 'photo' else None
+            photo = await self.api.prepare_photo(job['source'], part['reference'], destination) if part['kind'] == 'photo' else None
+            if (stop is not None and stop.is_set()) or destination in self.paused:
+                return
+            service, path, kwargs = publication(destination, target, part, parent, photo)
             # Commit before the first request that may publish a visible message.
             if not self.store.start_sending(job):
                 return
             publishing = True
-            service, path, kwargs = publication(destination, target, part, parent, photo)
-            result = self.api.request(service, path, **kwargs)
-            remote_id = str(result['message_id'] if destination == 'tg' else result['message']['body']['mid'])
+            result = await self.api.request(service, path, **kwargs)
+            remote_id = result['message_id'] if destination == 'tg' else result['message']['body']['mid']
+            if (not isinstance(remote_id, (str, int)) or isinstance(remote_id, bool)
+                    or not str(remote_id) or (destination == 'tg' and
+                    (not str(remote_id).isdigit() or int(remote_id) <= 0))):
+                raise TransportError('API не вернул корректный ID опубликованного сообщения')
+            remote_id = str(remote_id)
             self.store.update(job['id'], 'sent', remote_id=remote_id)
             print(f"sent job={job['id']} {job['source']}->{destination}", flush=True)
+        except asyncio.CancelledError:
+            if publishing:
+                self.store.update(job['id'], 'uncertain', 'Отмена во время публикации; требуется сверка')
+            raise
         except ApiError as exc:
             # A definitive rejection is safe to retry. A server 5xx may be post-publication.
             if exc.code in ('429', 'attachment.not.ready'):
@@ -876,29 +759,102 @@ class Bridge:
             print(f"failed job={job['id']} {exc}", flush=True)
         finally:
             with self.store.db:
-                self.store.set('next_' + destination, time.time() + (3.2 if destination == 'tg' else 0.6))
+                self.store.set('next_' + destination, time.time() + self.send_intervals[destination])
 
 
-def doctor(cfg, api, chats=False):
-    tg = api.request('tg', 'getMe')
-    mx = api.request('max', '/me')
+async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.2,
+                     heartbeat_interval=2, shutdown_timeout=30):
+    """One owner per poller/sender; expected service failures stay in that worker."""
+    install_signals = stop is None
+    stop = stop if stop is not None else asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def wait(delay):
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+
+    async def poller(platform):
+        failures = 0
+        while not stop.is_set():
+            if platform in bridge.paused:
+                await stop.wait()
+                return
+            delay = poll_interval
+            try:
+                await bridge.poll(platform)
+                failures = 0
+            except BridgeError as exc:
+                failures += 1
+                if isinstance(exc, ApiError) and exc.code == '409':
+                    raise BridgeError(f'{platform}: конфликт другого poller; мост остановлен') from None
+                if failures == 1 or failures % 30 == 0:
+                    print(f'poll {platform}: {exc}', flush=True)
+                delay = min(30, 2 ** min(failures, 5))
+                if isinstance(exc, ApiError):
+                    delay = max(delay, float(exc.retry_after or 0))
+                    if exc.code in ('401', '403'):
+                        bridge.paused.add(platform)
+                        print(f'{platform}: приём/отправка приостановлены; проверьте права и перезапустите мост', flush=True)
+            await wait(delay)
+
+    async def sender(platform):
+        while not stop.is_set():
+            await bridge.deliver(platform, stop)
+            await wait(delivery_interval)
+
+    async def heartbeat():
+        while not stop.is_set():
+            bridge.store.heartbeat()
+            await wait(heartbeat_interval)
+
+    if install_signals:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(signum, stop.set)
+    try:
+        bridge.store.runtime('running')
+        try:
+            async with asyncio.TaskGroup() as group:
+                workers = [group.create_task(poller(p), name='poll:' + p) for p in ('tg', 'max')]
+                workers += [group.create_task(sender(p), name='send:' + p) for p in ('tg', 'max')]
+                workers.append(group.create_task(heartbeat(), name='heartbeat'))
+                await stop.wait()
+                _, pending = await asyncio.wait(workers, timeout=shutdown_timeout)
+                for task in pending:
+                    task.cancel()
+        except BaseExceptionGroup as group_error:
+            error = group_error
+            while isinstance(error, BaseExceptionGroup):
+                error = error.exceptions[0]
+            raise error from None
+    finally:
+        if install_signals:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(signum)
+        bridge.store.runtime('stopped')
+
+
+async def doctor(cfg, api, chats=False):
+    tg = await api.request('tg', 'getMe')
+    mx = await api.request('max', '/me')
     ids = {'tg': str(tg['id']), 'max': str(mx['user_id'])}
     for platform, bot in [('tg', tg), ('max', mx)]:
         expected = cfg.get(platform.upper() + '_BOT_USERNAME', '').lstrip('@').lower()
         if expected and (bot.get('username') or '').lower() != expected:
             raise BridgeError(f'{platform}: токен относится к другому боту; проверьте ожидаемый username')
         print(f"{platform}: bot @{bot.get('username', '')}, id={ids[platform]}")
-    webhook = api.request('tg', 'getWebhookInfo')
-    subscriptions = api.request('max', '/subscriptions').get('subscriptions', [])
+    webhook = await api.request('tg', 'getWebhookInfo')
+    subscriptions = (await api.request('max', '/subscriptions')).get('subscriptions', [])
     if webhook.get('url') or subscriptions:
         raise BridgeError('У бота есть webhook-подписка. Нужна проверка перед переходом на тестовый polling; автоматически не отключаю.')
     print('Webhook-подписок нет; тестовый polling доступен.')
     if chats:
-        tg_chat = api.request('tg', 'getChat', query={'chat_id': cfg['TG_CHAT_ID']})
-        mx_chat = api.request('max', '/chats/' + cfg['MAX_CHAT_ID'])
+        tg_chat = await api.request('tg', 'getChat', query={'chat_id': cfg['TG_CHAT_ID']})
+        mx_chat = await api.request('max', '/chats/' + cfg['MAX_CHAT_ID'])
         if tg_chat.get('type') not in ('group', 'supergroup') or mx_chat.get('type') != 'chat':
             raise BridgeError('Для PoC разрешены только групповые чаты')
-        member = api.request('tg', 'getChatMember', query={'chat_id': cfg['TG_CHAT_ID'], 'user_id': ids['tg']})
+        member = await api.request('tg', 'getChatMember', query={'chat_id': cfg['TG_CHAT_ID'], 'user_id': ids['tg']})
         if member.get('status') not in ('administrator', 'creator') and not tg.get('can_read_all_group_messages'):
             raise BridgeError('Telegram: нужен отключённый Privacy Mode или роль администратора')
         if member.get('status') in ('left', 'kicked', 'restricted'):
@@ -907,7 +863,7 @@ def doctor(cfg, api, chats=False):
         if member.get('status') not in ('administrator', 'creator') and (
                 permissions.get('can_send_messages') is False or permissions.get('can_send_photos') is False):
             raise BridgeError('Telegram: в группе запрещена отправка текста или фото')
-        mx_member = api.request('max', '/chats/' + cfg['MAX_CHAT_ID'] + '/members/me')
+        mx_member = await api.request('max', '/chats/' + cfg['MAX_CHAT_ID'] + '/members/me')
         # In groups `write` grants moderation (edit/delete), not ordinary sending.
         # https://dev.max.ru/docs-api/objects/ChatMember
         if not mx_member.get('is_admin') or 'read_all_messages' not in (mx_member.get('permissions') or []):
@@ -916,8 +872,8 @@ def doctor(cfg, api, chats=False):
     return ids
 
 
-def discover(cfg, api, seconds, state=STATE):
-    doctor(cfg, api)
+async def discover(cfg, api, seconds, state=STATE):
+    await doctor(cfg, api)
     code_file = state / 'discovery-code'
     if not code_file.exists():
         code_file.write_text('SYNC-CHECK-' + secrets.token_hex(3).upper())
@@ -926,14 +882,14 @@ def discover(cfg, api, seconds, state=STATE):
     found, tg_cursor, mx_cursor = {}, None, None
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline and len(found) < 2:
-        tg_events = api.request('tg', 'getUpdates', method='POST', body={'offset': tg_cursor, 'timeout': 0, 'allowed_updates': ['message']})
+        tg_events = await api.request('tg', 'getUpdates', method='POST', body={'offset': tg_cursor, 'timeout': 0, 'allowed_updates': ['message']})
         for event in tg_events:
             msg = event.get('message') or {}
             if msg.get('text') == code and msg.get('chat', {}).get('type') in ('group', 'supergroup'):
                 found['tg'] = str(msg['chat']['id'])
         if tg_events:
             tg_cursor = max(e['update_id'] for e in tg_events) + 1
-        mx = api.request('max', '/updates', query={'marker': mx_cursor, 'timeout': 0, 'types': 'message_created'})
+        mx = await api.request('max', '/updates', query={'marker': mx_cursor, 'timeout': 0, 'types': 'message_created'})
         mx_cursor = mx.get('marker')
         for event in mx.get('updates', []):
             msg = event.get('message') or {}
@@ -941,7 +897,7 @@ def discover(cfg, api, seconds, state=STATE):
                 found['max'] = str(msg['recipient']['chat_id'])
         if found:
             (state / 'discovered.json').write_text(json.dumps(found))
-        time.sleep(1)
+        await asyncio.sleep(1)
     for platform, chat in found.items():
         print(f'{platform}: test_chat_id={chat}')
     if len(found) != 2:
@@ -1109,7 +1065,7 @@ def print_health(snapshot):
 class AlertMonitor:
     """Durable local alert outbox; no chat content or external messaging."""
     def __init__(self, path):
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=0.1)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
@@ -1305,12 +1261,16 @@ def main(argv=None):
         if args.command == 'bind':
             bind(state)
             return
-        cfg = config(require_chats=args.command == 'run')
-        api = Api(cfg)
+        return asyncio.run(network_command(args, state, db_path))
+
+
+async def network_command(args, state, db_path):
+    cfg = config(require_chats=args.command == 'run')
+    async with Api(cfg) as api:
         if args.command == 'discover':
-            discover(cfg, api, args.seconds, state)
+            await discover(cfg, api, args.seconds, state)
             return
-        ids = doctor(cfg, api, chats=bool(cfg.get('TG_CHAT_ID') and cfg.get('MAX_CHAT_ID')))
+        ids = await doctor(cfg, api, chats=bool(cfg.get('TG_CHAT_ID') and cfg.get('MAX_CHAT_ID')))
         if args.command == 'doctor':
             return
         with Store(db_path) as store:
@@ -1321,36 +1281,10 @@ def main(argv=None):
                 store.set('identity', identity)
             store.recover()
             bridge = Bridge(cfg, api, store, ids)
-            stopping = False
-
-            def stop(_signum, _frame):
-                nonlocal stopping
-                stopping = True
-
-            signal.signal(signal.SIGTERM, stop)
-            signal.signal(signal.SIGINT, stop)
-            print('Тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
-            errors = {'tg': 0, 'max': 0}
-            store.runtime('running')
-            try:
-                while not stopping:
-                    for platform in ('tg', 'max'):
-                        store.heartbeat()
-                        try:
-                            bridge.poll(platform)
-                            errors[platform] = 0
-                        except BridgeError as exc:
-                            errors[platform] += 1
-                            if errors[platform] == 1 or errors[platform] % 30 == 0:
-                                print(f'poll {platform}: {exc}', flush=True)
-                            if isinstance(exc, ApiError) and exc.code in ('401', '403', '409'):
-                                raise BridgeError(f'{platform}: остановка из-за авторизации, прав или другого poller') from None
-                        bridge.deliver(platform)
-                        store.heartbeat()
-                    time.sleep(1)
-            finally:
-                store.runtime('stopped')
+            print('Асинхронный тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
+            await run_bridge(bridge)
             print('Остановлено. Очередь сохранена.', flush=True)
+
 
 
 if __name__ == '__main__':
@@ -1363,3 +1297,7 @@ if __name__ == '__main__':
     except (OSError, sqlite3.Error):
         print('Ошибка локального хранилища или вывода; проверьте доступ и свободное место', file=sys.stderr)
         sys.exit(1)
+    except Exception:
+        print('Внутренняя ошибка: мост остановлен, очередь сохранена; требуется проверка версии', file=sys.stderr)
+        sys.exit(1)
+

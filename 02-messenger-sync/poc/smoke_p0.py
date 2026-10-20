@@ -2,6 +2,7 @@
 """Repeatable P0 smoke checks: temporary databases, real CLI, no network calls."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import subprocess
@@ -35,7 +36,13 @@ class LocalApi:
         self.state = state
         self.sent = 0
 
-    def request(self, service, path, **_kwargs):
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        pass
+
+    async def request(self, service, path, **_kwargs):
         if service == 'tg' and path == 'getUpdates':
             return []
         if service == 'max' and path == '/updates':
@@ -82,10 +89,10 @@ def smoke_ingest(state):
         for _ in range(2):
             store.accept('max', [mx('before'), mx('bad', broken=True), mx('after')], 123, '-200', '88')
         bridge = b.Bridge(CFG, LocalApi(state), store, IDS)
-        bridge.deliver('tg')
+        asyncio.run(bridge.deliver('tg'))
         with store.db:
             store.set('next_tg', 0)
-        bridge.deliver('tg')
+        asyncio.run(bridge.deliver('tg'))
     with b.Store(state / 'bridge.sqlite3', readonly=True) as store:
         assert store.get('cursor_max') == '123'
         assert store.db.execute("SELECT count(*) FROM jobs WHERE state='sent'").fetchone()[0] == 2
@@ -103,7 +110,7 @@ def smoke_queue(state):
     cli(state, 'queue', 'skip', '3', '--remaining', '--reason', 'synthetic omission')
     cli(state, 'queue', 'confirm', '1', '--remote-id', 'manual-copy', '--reason', 'synthetic review')
     with b.Store(state / 'bridge.sqlite3') as store:
-        b.Bridge(CFG, LocalApi(state), store, IDS).deliver('max')
+        asyncio.run(b.Bridge(CFG, LocalApi(state), store, IDS).deliver('max'))
         assert [r[0] for r in store.db.execute('SELECT state FROM jobs ORDER BY id')] == [
             'sent', 'sent', 'skipped', 'skipped', 'skipped']
         assert store.db.execute('SELECT count(*) FROM audit').fetchone()[0] == 5
@@ -163,7 +170,9 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == '--child':
         state = Path(sys.argv[2])
         b.config = lambda require_chats=False: CFG
-        b.doctor = lambda *args, **kwargs: IDS
+        async def doctor(*args, **kwargs):
+            return IDS
+        b.doctor = doctor
         b.Api = lambda cfg: LocalApi(state)
         return b.main(['run', '--state-dir', str(state)])
     with tempfile.TemporaryDirectory(prefix='bridge-p0-smoke-') as tmp:

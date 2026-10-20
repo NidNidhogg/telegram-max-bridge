@@ -1,6 +1,12 @@
 """Async transport/runtime checks against a real local HTTP server; no live tokens."""
 import asyncio
+from contextlib import redirect_stdout
+import io
 import json
+from pathlib import Path
+import sqlite3
+import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -8,9 +14,10 @@ import aiohttp
 from aiohttp import web
 
 import bridge as b
+from smoke_p0 import tg, mx
 
 
-class HttpTests(unittest.IsolatedAsyncioTestCase):
+class HttpServer(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.calls = []
         self.handler = lambda request, body: web.json_response({'ok': True, 'result': {}})
@@ -31,7 +38,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         return await result if asyncio.iscoroutine(result) else result
 
     async def api(self, timeout=None):
-        api = b.AsyncApi({'TG_BOT_TOKEN': 'PRIVATE_TG', 'MAX_BOT_TOKEN': 'PRIVATE_MAX'},
+        api = b.Api({'TG_BOT_TOKEN': 'PRIVATE_TG', 'MAX_BOT_TOKEN': 'PRIVATE_MAX'},
                          tg_base=self.url, max_base=self.url, timeout=timeout)
         await api.__aenter__()
         self.addAsyncCleanup(api.__aexit__, None, None, None)
@@ -40,6 +47,9 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     def allow_local_media(self, url):
         if not url.startswith(self.url + '/'):
             self.original_media_check(url)
+
+
+class HttpTests(HttpServer):
 
     async def test_post_connection_loss_is_not_retried_on_reused_connection(self):
         async with aiohttp.ClientSession() as session:
@@ -174,6 +184,294 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 2)
         # Let timed-out synthetic server handlers finish before closing the listener.
         await asyncio.sleep(0.25)
+
+
+class RuntimeTests(HttpServer):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        output = redirect_stdout(io.StringIO())
+        output.__enter__()
+        self.addCleanup(output.__exit__, None, None, None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = b.Store(Path(self.tmp.name) / 'bridge.sqlite3')
+        self.addCleanup(self.store.db.close)
+        self.client = await self.api()
+        self.bridge = b.Bridge({'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}, self.client,
+                              self.store, {'tg': '99', 'max': '88'}, send_intervals={'tg': 0, 'max': 0})
+        self.handler = self.normal
+
+    def normal(self, request, body):
+        if request.path == '/getUpdates':
+            return web.json_response({'ok': True, 'result': []})
+        if request.path == '/updates':
+            return web.json_response({'updates': [], 'marker': 42})
+        if request.path == '/sendMessage':
+            return web.json_response({'ok': True, 'result': {'message_id': len(self.calls)}})
+        return web.json_response({'message': {'body': {'mid': 'copy-' + str(len(self.calls))}}})
+
+    async def until(self, predicate, seconds=3):
+        async with asyncio.timeout(seconds):
+            while not predicate():
+                await asyncio.sleep(0.005)
+
+    def start(self, **kwargs):
+        stop = asyncio.Event()
+        task = asyncio.create_task(b.run_bridge(self.bridge, stop, poll_interval=0.01,
+            delivery_interval=0.005, heartbeat_interval=0.01, shutdown_timeout=0.03, **kwargs))
+
+        async def cleanup():
+            stop.set()
+            if not task.done():
+                await asyncio.wait_for(task, 2)
+            elif not task.cancelled():
+                task.exception()
+
+        self.addAsyncCleanup(cleanup)
+        return stop, task
+
+    def state(self, jid=1):
+        return self.store.db.execute('SELECT state FROM jobs WHERE id=?', (jid,)).fetchone()[0]
+
+    async def test_held_max_poll_does_not_stop_telegram_poll_send_or_heartbeat(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.store.accept('max', [mx('original')], 1, '-200', '88')
+
+        async def handle(request, body):
+            if request.path == '/updates':
+                entered.set()
+                await release.wait()
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': True, 'result': [tg(1)]})
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        try:
+            await entered.wait()
+            await self.until(lambda: self.state() == 'sent' and self.store.get('cursor_tg') == '2')
+            before = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != before)
+            self.assertEqual(self.store.get('cursor_max'), '1')
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            stop.set()
+            await task
+
+    async def test_held_telegram_poll_does_not_stop_max(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+
+        async def handle(request, body):
+            if request.path == '/getUpdates':
+                entered.set()
+                await release.wait()
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        try:
+            await entered.wait()
+            await self.until(lambda: self.state() == 'sent' and self.store.get('cursor_max') == '42')
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            stop.set()
+            await task
+
+    async def test_lost_publish_response_is_uncertain_and_blocks_only_destination(self):
+        self.store.accept('tg', [tg(1), tg(2)], 3, '-100', '99')
+        self.store.accept('max', [mx('one')], 1, '-200', '88')
+
+        def handle(request, body):
+            if request.path == '/messages':
+                request.transport.abort()
+                return web.Response()
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        await self.until(lambda: self.state() == 'uncertain' and self.state(3) == 'sent')
+        await asyncio.sleep(0.05)
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 1)
+        self.assertEqual(self.state(2), 'pending')
+        stop.set()
+        await task
+
+    async def test_shutdown_during_publication_is_uncertain(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+
+        async def handle(request, body):
+            if request.path == '/messages':
+                entered.set()
+                await release.wait()
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        await entered.wait()
+        self.assertEqual(self.state(), 'sending')
+        stop.set()
+        await task
+        self.assertEqual(self.state(), 'uncertain')
+        release.set()
+
+    async def test_shutdown_during_photo_preparation_stays_pending(self):
+        entered = asyncio.Event()
+        event = tg(1)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+
+        async def prepare(*args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.client.prepare_photo = prepare
+        stop, task = self.start()
+        await entered.wait()
+        stop.set()
+        await task
+        self.assertEqual(self.state(), 'pending')
+        self.assertFalse(any(c[1] == '/messages' for c in self.calls))
+
+    async def test_finishing_preparation_after_stop_does_not_start_publication(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        event = tg(1)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+
+        async def prepare(*args):
+            entered.set()
+            await release.wait()
+            return {'token': 'image'}
+
+        self.client.prepare_photo = prepare
+        stop, task = self.start()
+        await entered.wait()
+        stop.set()
+        release.set()
+        await task
+        self.assertEqual(self.state(), 'pending')
+        self.assertFalse(any(c[1] == '/messages' for c in self.calls))
+
+    async def test_success_without_remote_id_is_uncertain(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return web.json_response({'message': {'body': {'mid': None}}})
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        await self.until(lambda: self.state() == 'uncertain')
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 1)
+        stop.set()
+        await task
+
+    async def test_429_delays_one_sender_without_stopping_other_workers(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.store.accept('max', [mx('one')], 1, '-200', '88')
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return web.json_response({'parameters': {'retry_after': 120}}, status=429)
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        await self.until(lambda: self.state(2) == 'sent')
+        await self.until(lambda: self.store.db.execute('SELECT ready FROM jobs WHERE id=1').fetchone()[0] > time.time())
+        self.assertEqual(self.state(), 'pending')
+        self.assertGreater(self.store.db.execute('SELECT ready FROM jobs WHERE id=1').fetchone()[0], time.time() + 100)
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 1)
+        stop.set()
+        await task
+
+    async def test_401_pauses_platform_until_restart_but_not_other_platform(self):
+        self.store.accept('max', [mx('one')], 1, '-200', '88')
+
+        def handle(request, body):
+            if request.path == '/updates':
+                return web.json_response({}, status=401)
+            return self.normal(request, body)
+
+        self.handler = handle
+        stop, task = self.start()
+        await self.until(lambda: 'max' in self.bridge.paused and self.state() == 'sent')
+        await asyncio.sleep(0.05)
+        self.assertEqual(sum(c[1] == '/updates' for c in self.calls), 1)
+        self.assertIsNotNone(self.store.get('last_poll_error_max'))
+        self.assertFalse(task.done())
+        stop.set()
+        await task
+
+    async def test_conflicting_poller_stops_entire_runtime(self):
+        self.handler = lambda request, body: web.json_response({}, status=409)
+        _, task = self.start()
+        with self.assertRaisesRegex(b.BridgeError, 'poller'):
+            await task
+        self.assertEqual(self.store.get('runtime_state'), 'stopped')
+
+    async def test_programming_error_stops_runtime_instead_of_retrying(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': True, 'result': ['PRIVATE_INVALID_ENVELOPE']})
+            return self.normal(request, body)
+
+        self.handler = handle
+        _, task = self.start()
+        with self.assertRaises(TypeError):
+            await task
+        self.assertEqual(self.store.get('runtime_state'), 'stopped')
+
+    async def test_result_commit_failure_never_republishes(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.store.db.execute("""CREATE TRIGGER fail_sent BEFORE UPDATE ON jobs
+            WHEN NEW.state='sent' BEGIN SELECT RAISE(ABORT,'synthetic'); END""")
+        _, task = self.start()
+        with self.assertRaises(sqlite3.IntegrityError):
+            await task
+        self.assertEqual(self.state(), 'sending')
+        self.store.recover()
+        self.assertEqual(self.state(), 'uncertain')
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 1)
+
+    async def test_overlapping_attempts_can_publish_queue_head_only_once(self):
+        event = tg(1)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+        entered, release = asyncio.Event(), asyncio.Event()
+        preparations = 0
+
+        async def prepare(*args):
+            nonlocal preparations
+            preparations += 1
+            if preparations == 2:
+                entered.set()
+            await release.wait()
+            return {'token': 'image'}
+
+        self.client.prepare_photo = prepare
+        tasks = [asyncio.create_task(self.bridge.deliver('max')) for _ in range(2)]
+        await entered.wait()
+        release.set()
+        await asyncio.gather(*tasks)
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 1)
+        self.assertEqual(self.state(), 'sent')
+
+    async def test_order_is_preserved_for_100_messages_each_way(self):
+        self.store.accept('tg', [tg(i, f'item-{i}') for i in range(1, 101)], 101, '-100', '99')
+        self.store.accept('max', [mx(str(i)) for i in range(1, 101)], 101, '-200', '88')
+        stop, task = self.start()
+        await self.until(lambda: self.store.db.execute("SELECT count(*) FROM jobs WHERE state='sent'").fetchone()[0] == 200, seconds=10)
+        delivered = [json.loads(c[3])['text'] for c in self.calls if c[1] == '/messages']
+        self.assertEqual([text.split('item-')[1] for text in delivered], [str(i) for i in range(1, 101)])
+        self.assertEqual(sum(c[1] == '/sendMessage' for c in self.calls), 100)
+        stop.set()
+        await task
 
 
 if __name__ == '__main__':

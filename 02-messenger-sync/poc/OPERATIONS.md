@@ -1,24 +1,24 @@
 # Разбор очереди Telegram ↔ MAX
 
-Команды выполняются из корня проекта. Просмотр работает без токенов и сетевых запросов. По умолчанию используется `.state/bridge.sqlite3`; `--state-dir /абсолютный/путь` выбирает отдельный каталог состояния, например для локальных испытаний.
+Команды выполняются из корня проекта после `rtk proxy uv sync --locked`. Просмотр работает без токенов и сетевых запросов. По умолчанию используется `.state/bridge.sqlite3`; `--state-dir /абсолютный/путь` выбирает отдельный каталог состояния, например для локальных испытаний.
 
 Актуализация 20.10.2026: обновлённый мост и монитор запущены как локальные фоновые процессы, пользователь подтвердил ручной тест. [Протокол](LIVE-TEST-2026-10-20.md). В этом окружении PID сохранены в `.state/live-bridge.pid` и `.state/live-monitor.pid`, вывод — в одноимённых `.log`; интервал монитора — 5 секунд. Для остановки фонового процесса отправить SIGTERM его проверенному текущему PID. Наличие PID-файла само по себе не подтверждает, что процесс ещё работает; использовать `health` и блокировки. При клонировании эти локальные файлы отсутствуют.
 
 ## Просмотр
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py status
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue list --limit 100
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue show 12
-rtk proxy python3 02-messenger-sync/poc/bridge.py quarantine list
-rtk proxy python3 02-messenger-sync/poc/bridge.py quarantine show 3
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue list --limit 100
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue show 12
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine list
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine show 3
 ```
 
 Команды `list` показывают первые записи по ID в пределах лимита; `show` — метаданные выбранной записи. Текст сообщения, исходное событие, приватные URL и причины ручных действий из аудита в обычный вывод не включаются. `queue show` показывает связанные части и историю состояний. Просмотр можно выполнять при работающем мосте; он не мигрирует базу.
 
 ## Перед изменением
 
-Остановить мост через Ctrl+C или SIGTERM и дождаться завершения. Изменяющая команда использует ту же исключительную блокировку, что `run`, и откажет при работающем процессе. После аварии оставшийся `sending` преобразуется в `uncertain` перед разбором.
+Остановить мост через Ctrl+C или SIGTERM и дождаться завершения: async-версия даёт активным запросам до 30 секунд, затем отменяет их с сохранением `uncertain` при возможной публикации. Не освобождать блокировку и не запускать второй экземпляр, пока первый не завершился. Изменяющая команда использует ту же исключительную блокировку, что `run`, и откажет при работающем процессе. После аварии оставшийся `sending` преобразуется в `uncertain` перед разбором.
 
 Каждое действие требует непустой `--reason` длиной не более 1000 символов. Причина и переход состояния сохраняются в `audit` атомарно с действием; не записывать туда секреты или переписку.
 
@@ -27,7 +27,7 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py quarantine show 3
 Устранить причину отказа, затем вернуть задачу в ожидание:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue retry 12 --reason 'Причина отказа устранена'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --reason 'Причина отказа устранена'
 ```
 
 Команда не отправляет сообщение сама. Отправка выполняется после следующего `run`. Повтор команды для уже ожидающей задачи ничего не меняет.
@@ -37,7 +37,7 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py queue retry 12 --reason 'Пр�
 Сверить целевую группу с исходным сообщением. Если копия найдена, записать её ID:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue confirm 12 --remote-id mid.example --reason 'Копия найдена в целевой группе'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue confirm 12 --remote-id mid.example --reason 'Копия найдена в целевой группе'
 ```
 
 Для копии в Telegram нужен положительный числовой ID. Подтверждение восстанавливает связь для ответов. Повтор подтверждения с тем же ID безопасен; другой ID для уже доставленной задачи отклоняется. ID, занятый другой задачей того же направления, также отклоняется.
@@ -45,7 +45,7 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py queue confirm 12 --remote-id m
 Если принято решение повторить неопределённую отправку:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue retry 12 --accept-duplicate-risk --reason 'После сверки принято решение о повторе'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --accept-duplicate-risk --reason 'После сверки принято решение о повторе'
 ```
 
 Повтор может создать дубль, если первая публикация всё-таки состоялась. Флаг фиксирует осознанное решение; программа не утверждает, что копии нет.
@@ -55,8 +55,8 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py queue retry 12 --accept-duplic
 Пропустить одну задачу либо все ещё неотправленные части того же сообщения начиная с неё:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue skip 12 --reason 'Доставка отменена ответственным'
-rtk proxy python3 02-messenger-sync/poc/bridge.py queue skip 12 --remaining --reason 'Оставшиеся части сообщения отменены'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --reason 'Доставка отменена ответственным'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --remaining --reason 'Оставшиеся части сообщения отменены'
 ```
 
 `skipped` не блокирует следующие сообщения. Уже отправленные части сохраняются, части других сообщений не затрагиваются. Пропуск одного фрагмента без `--remaining` оставляет остальные фрагменты в очереди.
@@ -66,7 +66,7 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py queue skip 12 --remaining --re
 После исправления обработчика повторно разобрать сохранённое событие:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py quarantine retry 3 --reason 'Обработчик исправлен и проверен'
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine retry 3 --reason 'Обработчик исправлен и проверен'
 ```
 
 Команда использует сохранённую привязку ботов и чатов. Если ошибка остаётся, событие сохраняет состояние `open`, причина и счётчик попыток обновляются. При успехе оно становится `resolved`, задачи появляются в очереди без перемещения курсора. Повтор для `resolved` ничего не добавляет. Восстановленное сообщение может быть доставлено после более новых.
@@ -74,8 +74,8 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py quarantine retry 3 --reason '�
 ## Возобновление
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py status
-rtk proxy python3 02-messenger-sync/poc/bridge.py run
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py run
 ```
 
 Перед миграцией создаётся резервная копия предыдущей схемы рядом с базой с правами 0600. Не заменять рабочую базу старой копией при запущенном процессе: откат состояния может привести к повтору уже опубликованных сообщений.
@@ -83,8 +83,8 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py run
 ## Мониторинг
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py status --json
-rtk proxy python3 02-messenger-sync/poc/bridge.py health --json
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status --json
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py health --json
 ```
 
 `status` возвращает код 0, если удалось сформировать вывод; смотреть поле `ok`. `health` возвращает код 0 при `ok=true`, 1 при проблеме. Ошибка аргументов CLI даёт код 2. Эти команды читают локальное состояние и не обращаются к API. При отсутствии или недоступности базы `health` возвращает JSON с причиной `state_missing` или `state_unavailable`.
@@ -94,13 +94,13 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py health --json
 Для непрерывного наблюдения запустить **отдельный процесс**, пока мост работает в другом терминале:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py monitor --interval 30 --stale-after 180 --queue-age 300 --alerts-file 02-messenger-sync/.state/alerts.jsonl
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py monitor --interval 30 --stale-after 180 --queue-age 300 --alerts-file 02-messenger-sync/.state/alerts.jsonl
 ```
 
 Один проход для внешнего планировщика:
 
 ```sh
-rtk proxy python3 02-messenger-sync/poc/bridge.py monitor --once
+rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py monitor --once
 ```
 
 Без `--alerts-file` события пишутся в stdout, по одному JSON-объекту на строку. При неизменном состоянии вывода нет. Все запуски одного монитора должны использовать один и тот же каталог состояния и один выбранный канал вывода: отметка о выдаче относится к событию, а не к каждому возможному файлу/получателю. Уже выданные события не переигрываются при смене канала.
@@ -126,3 +126,7 @@ rtk proxy python3 02-messenger-sync/poc/bridge.py monitor --once
 Ошибка записи JSONL оставляет событие в очереди; после исправления вывода запустить монитор повторно. Авария после записи строки, но до фиксации отметки может дать повтор с тем же `event_id`, поэтому внешний обработчик должен удалять такие повторы. Внешний получатель и канал доставки ещё не подключены. Для обнаружения остановки самого монитора и постоянной работы потребуется служба/внешний контроль на этапе P1.2.
 
 Существующий процесс старой версии нужно перезапустить обновлённым кодом, чтобы он начал записывать телеметрию. В старых задачах неизвестный возраст сохраняется как неизвестный; миграция не придумывает время получения сообщения. Схема версии 3, резервные копии, аудит и данные монитора остаются в `.state`; автоматическая очистка относится к P1.3.
+
+## Ошибки async-получателей
+
+При временном сбое получатель повторяет опрос с задержкой 2–30 секунд, учитывая больший `retry_after`. Во время ожидания другой получатель, независимый отправитель и heartbeat продолжаются. При 401/403 опроса платформа приостанавливается до проверки токена/прав и перезапуска; исправность heartbeat сама по себе не означает исправность этой платформы. Проверить `health --json` и время успешного опроса. 409 означает конфликт poller и остановку всего моста: найти второй экземпляр перед перезапуском. Ошибка SQLite или программы также останавливает процесс; не повторять неопределённые отправки без сверки.
