@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -20,6 +21,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import aiohttp
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = ROOT / '.env'
@@ -269,6 +272,150 @@ class Api:
         endpoint = self.request('max', '/uploads', method='POST', query={'type': 'image'})
         uploaded = self.request('media', endpoint['url'], method='POST',
                                 upload=multipart({}, 'data', data, filename, mime))
+        if uploaded.get('photos'):
+            return {'photos': uploaded['photos']}
+        token = uploaded.get('token') or endpoint.get('token')
+        if token:
+            return {'token': token}
+        raise BridgeError('Ответ загрузки MAX не содержит токен картинки')
+
+
+class AsyncApi:
+    """Bounded async transport; publication is never retried by this adapter."""
+    def __init__(self, cfg, *, tg_base=None, max_base=None, timeout=None):
+        self.cfg = cfg
+        self.tg_base = tg_base or 'https://api.telegram.org/bot' + cfg['TG_BOT_TOKEN']
+        self.max_base = max_base or MAX_API
+        self.timeout = timeout or aiohttp.ClientTimeout(total=25, connect=5, sock_read=20)
+        self.contexts = {'tg': ssl.create_default_context(), 'max': ssl.create_default_context()}
+        if cfg.get('MAX_CA_FILE'):
+            ca_path = Path(cfg['MAX_CA_FILE'])
+            self.contexts['max'].load_verify_locations(cafile=str(ca_path if ca_path.is_absolute() else ROOT / ca_path))
+        self.sessions = {}
+
+    async def __aenter__(self):
+        try:
+            for platform in ('tg', 'max'):
+                connector = aiohttp.TCPConnector(ssl=self.contexts[platform], limit=6, limit_per_host=4)
+                self.sessions[platform] = aiohttp.ClientSession(connector=connector, timeout=self.timeout,
+                    cookie_jar=aiohttp.DummyCookieJar(), trust_env=False)
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
+        return self
+
+    async def __aexit__(self, *_exc):
+        for session in self.sessions.values():
+            await session.close()
+        self.sessions.clear()
+
+    async def read(self, platform, url, *, method='GET', headers=None, data=None,
+                   limit=2 * 1024 * 1024, redirects=False):
+        try:
+            for hop in range(6):
+                async with self.sessions[platform].request(method, url, headers=headers,
+                        data=data, allow_redirects=False) as response:
+                    if response.status in (301, 302, 303, 307, 308) and redirects:
+                        if method != 'GET' or hop == 5 or 'Location' not in response.headers:
+                            raise BridgeError('Небезопасное перенаправление картинки')
+                        url = urllib.parse.urljoin(url, response.headers['Location'])
+                        check_media_url(url)
+                        headers = {'User-Agent': 'messenger-sync/1'}
+                        continue
+                    chunks, size = [], 0
+                    async for chunk in response.content.iter_chunked(65536):
+                        size += len(chunk)
+                        if size > limit:
+                            raise TransportError('Превышен предел размера ответа')
+                        chunks.append(chunk)
+                    return response.status, b''.join(chunks)
+        except (aiohttp.ClientError, OSError, TimeoutError):
+            raise TransportError('Ошибка соединения или TLS') from None
+
+    @staticmethod
+    def error(service, status, result):
+        result = result if isinstance(result, dict) else {}
+        code = result.get('error_code', result.get('code', status))
+        if (not isinstance(code, (str, int)) or len(str(code)) > 64
+                or (str(code) != 'attachment.not.ready' and not str(code).isdigit())):
+            code = status
+        params = result.get('parameters')
+        retry = params.get('retry_after', 0) if isinstance(params, dict) else 0
+        if not isinstance(retry, (float, int)) or not math.isfinite(retry) or retry < 0:
+            retry = 0
+        return ApiError(service, code, retry)
+
+    async def request(self, service, path, method='GET', query=None, body=None, upload=None):
+        if service == 'tg':
+            url, platform, headers = self.tg_base + '/' + path, 'tg', {}
+        elif service == 'max':
+            url, platform = self.max_base + path, 'max'
+            headers = {'Authorization': self.cfg['MAX_BOT_TOKEN']}
+        else:
+            check_media_url(path)
+            url, platform, headers = path, 'max', {}
+        if query:
+            url += '?' + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
+        if upload:
+            data, mime = upload
+            headers['Content-Type'] = mime
+        elif body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode()
+            headers['Content-Type'] = 'application/json'
+        else:
+            data = None
+        status, raw = await self.read(platform, url, method=method, headers=headers, data=data)
+        try:
+            result = json.loads(raw)
+        except (ValueError, UnicodeError):
+            if status >= 300:
+                raise self.error(service, status, {}) from None
+            raise TransportError(f'{service}: не удалось разобрать ответ API') from None
+        if status >= 300:
+            raise self.error(service, status, result)
+        if not isinstance(result, dict):
+            raise TransportError(f'{service}: неожиданный формат ответа')
+        if service == 'tg':
+            if not result.get('ok'):
+                raise self.error(service, 400, result)
+            if 'result' not in result:
+                raise TransportError('tg: отсутствует результат API')
+            return result['result']
+        return result
+
+    async def download(self, platform, reference):
+        if platform == 'tg':
+            info = await self.request('tg', 'getFile', query={'file_id': reference})
+            if info.get('file_size', 0) > PHOTO_LIMIT:
+                raise BridgeError('Картинка превышает предел PoC 10 MiB')
+            file_path = info.get('file_path', '')
+            if not file_path or '..' in file_path.split('/'):
+                raise BridgeError('Не получен безопасный путь картинки Telegram')
+            url = 'https://api.telegram.org/file/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + file_path
+        else:
+            check_media_url(reference)
+            url = reference
+        status, data = await self.read(platform, url, limit=PHOTO_LIMIT, redirects=True)
+        if status != 200:
+            raise TransportError('Не удалось скачать картинку')
+        if data.startswith(b'\xff\xd8\xff'):
+            mime = 'image/jpeg'
+        elif data.startswith(b'\x89PNG\r\n\x1a\n'):
+            mime = 'image/png'
+        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+            mime = 'image/webp'
+        else:
+            raise BridgeError('Для PoC поддерживаются картинки JPEG, PNG и WEBP')
+        return data, mime
+
+    async def prepare_photo(self, source, reference, destination):
+        data, mime = await self.download(source, reference)
+        filename = 'image' + (mimetypes.guess_extension(mime) or '.jpg')
+        if destination == 'tg':
+            return data, mime, filename
+        endpoint = await self.request('max', '/uploads', method='POST', query={'type': 'image'})
+        uploaded = await self.request('media', endpoint['url'], method='POST',
+            upload=multipart({}, 'data', data, filename, mime))
         if uploaded.get('photos'):
             return {'photos': uploaded['photos']}
         token = uploaded.get('token') or endpoint.get('token')
