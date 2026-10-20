@@ -605,6 +605,17 @@ class Store:
                 row = self.db.execute('SELECT destination FROM jobs WHERE id=?', (jid,)).fetchone()
                 self.set('last_delivery_success_' + row['destination'], now)
 
+    def start_sending(self, job):
+        """Claim the head once, after preparation and immediately before publication."""
+        with self.db:
+            now = time.time()
+            return self.db.execute('''UPDATE jobs SET state='sending',error=NULL,
+                remote_id=NULL,ready=?,attempts=attempts+1,updated=?
+                WHERE id=? AND state='pending' AND ready<=? AND id=(
+                    SELECT min(id) FROM jobs WHERE destination=?
+                    AND state NOT IN ('sent','skipped'))''',
+                (now, now, job['id'], now, job['destination'])).rowcount == 1
+
     def recover(self):
         with self.db:
             self.db.execute("UPDATE jobs SET state='uncertain',error='Процесс остановился при отправке',updated=? WHERE state='sending'", (time.time(),))
@@ -627,6 +638,27 @@ class Store:
         with self.db:
             self.set('last_poll_error_' + platform, str(error))
             self.set('last_poll_failure_' + platform, time.time())
+
+
+def publication(destination, target, part, parent, photo):
+    """Build the one request that can publish a visible message; no I/O or state."""
+    if destination == 'tg':
+        payload = {'chat_id': target}
+        if parent:
+            payload['reply_parameters'] = {'message_id': int(parent), 'allow_sending_without_reply': True}
+        if photo:
+            data, mime, filename = photo
+            payload['caption'] = part['text']
+            return 'tg', 'sendPhoto', dict(method='POST',
+                upload=multipart(payload, 'photo', data, filename, mime))
+        payload.update(text=part['text'], link_preview_options={'is_disabled': True})
+        return 'tg', 'sendMessage', dict(method='POST', body=payload)
+    payload = {'text': part['text']}
+    if photo:
+        payload['attachments'] = [{'type': 'image', 'payload': photo}]
+    if parent:
+        payload['link'] = {'type': 'reply', 'mid': parent}
+    return 'max', '/messages', dict(method='POST', query={'chat_id': target}, body=payload)
 
 
 class Bridge:
@@ -666,29 +698,12 @@ class Bridge:
         try:
             photo = self.api.prepare_photo(job['source'], part['reference'], destination) if part['kind'] == 'photo' else None
             # Commit before the first request that may publish a visible message.
-            self.store.update(job['id'], 'sending')
+            if not self.store.start_sending(job):
+                return
             publishing = True
-            if destination == 'tg':
-                payload = {'chat_id': target}
-                if parent:
-                    payload['reply_parameters'] = {'message_id': int(parent), 'allow_sending_without_reply': True}
-                if photo:
-                    data, mime, filename = photo
-                    payload['caption'] = part['text']
-                    result = self.api.request('tg', 'sendPhoto', method='POST',
-                                              upload=multipart(payload, 'photo', data, filename, mime))
-                else:
-                    payload.update(text=part['text'], link_preview_options={'is_disabled': True})
-                    result = self.api.request('tg', 'sendMessage', method='POST', body=payload)
-                remote_id = str(result['message_id'])
-            else:
-                payload = {'text': part['text']}
-                if photo:
-                    payload['attachments'] = [{'type': 'image', 'payload': photo}]
-                if parent:
-                    payload['link'] = {'type': 'reply', 'mid': parent}
-                result = self.api.request('max', '/messages', method='POST', query={'chat_id': target}, body=payload)
-                remote_id = str(result['message']['body']['mid'])
+            service, path, kwargs = publication(destination, target, part, parent, photo)
+            result = self.api.request(service, path, **kwargs)
+            remote_id = str(result['message_id'] if destination == 'tg' else result['message']['body']['mid'])
             self.store.update(job['id'], 'sent', remote_id=remote_id)
             print(f"sent job={job['id']} {job['source']}->{destination}", flush=True)
         except ApiError as exc:

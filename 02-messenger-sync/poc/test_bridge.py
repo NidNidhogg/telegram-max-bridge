@@ -83,6 +83,17 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(self.jobs()), 1)
         self.assertEqual(self.store.get('cursor_tg'), '2')
 
+    def test_only_pending_due_head_can_be_claimed_once(self):
+        self.store.accept('tg', [tg(1), tg(2)], 3, '-100', '99')
+        first, second = self.jobs()
+        self.assertFalse(self.store.start_sending(second))
+        self.assertTrue(self.store.start_sending(first))
+        self.assertFalse(self.store.start_sending(first))
+        self.assertFalse(self.store.start_sending(second))
+        self.store.update(1, 'sent', remote_id='first')
+        self.store.update(2, 'pending', delay=60)
+        self.assertFalse(self.store.start_sending(second))
+
     def test_identical_human_messages_are_distinct(self):
         self.store.accept('tg', [tg(1), tg(2, author=11)], 3, '-100', '99')
         self.assertEqual(len(self.jobs()), 2)
