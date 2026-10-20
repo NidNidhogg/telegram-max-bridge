@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""Local Telegram/MAX test bridge. Standard library only; no production service."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import mimetypes
+import os
+from pathlib import Path
+import secrets
+import signal
+import sqlite3
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+ENV = ROOT / '.env'
+STATE = ROOT / '.state'
+MAX_API = 'https://platform-api2.max.ru'
+PHOTO_LIMIT = 10 * 1024 * 1024
+MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
+                 'vkuserphoto.ru', 'vk-cdn.net')
+
+
+class BridgeError(Exception):
+    """Only controlled, secret-free messages may be put in this exception."""
+
+
+class ApiError(BridgeError):
+    def __init__(self, service, code, retry_after=0):
+        self.code = str(code)
+        self.retry_after = retry_after
+        super().__init__(f'{service}: API error {self.code}')
+
+
+class TransportError(BridgeError):
+    pass
+
+
+def config(require_chats=False):
+    values = {}
+    if ENV.exists():
+        for line in ENV.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                values[key.strip()] = value.strip().strip('\"\'')
+    for key in ('TG_BOT_TOKEN', 'MAX_BOT_TOKEN'):
+        if not values.get(key):
+            raise BridgeError(f'Заполните {key} в локальном .env')
+    for key in ('TG_CHAT_ID', 'MAX_CHAT_ID'):
+        if require_chats and not values.get(key):
+            raise BridgeError(f'Не выбран тестовый чат: {key}')
+        if values.get(key):
+            try:
+                values[key] = str(int(values[key]))
+            except ValueError:
+                raise BridgeError(f'{key} должен быть целым числом') from None
+    return values
+
+
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_media_url(newurl)
+        # Never forward authorization headers to a redirect target.
+        if req.get_method() != 'GET':
+            raise BridgeError('Перенаправление загрузки требует проверки')
+        return urllib.request.Request(newurl, headers={'User-Agent': 'messenger-sync-poc/1'})
+
+
+def check_media_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or '').lower()
+    if (parsed.scheme != 'https' or parsed.username or parsed.password
+            or parsed.port not in (None, 443)
+            or not any(host == d or host.endswith('.' + d) for d in MEDIA_DOMAINS)):
+        raise BridgeError('Неизвестный адрес медиа MAX: требуется проверка домена')
+
+
+def multipart(fields, field, data, filename, mime):
+    boundary = 'sync_' + secrets.token_hex(16)
+    parts = []
+    for key, value in fields.items():
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    safe_name = Path(filename).name.replace('"', '').replace('\r', '').replace('\n', '')
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; '
+                  f'filename="{safe_name}"\r\nContent-Type: {mime}\r\n\r\n').encode())
+    parts.extend([data, f'\r\n--{boundary}--\r\n'.encode()])
+    return b''.join(parts), f'multipart/form-data; boundary={boundary}'
+
+
+class Api:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        ctx = ssl.create_default_context()
+        self.opener = urllib.request.build_opener(
+            SafeRedirect(), urllib.request.HTTPSHandler(context=ctx))
+        max_ctx = ssl.create_default_context()
+        if cfg.get('MAX_CA_FILE'):
+            ca_path = Path(cfg['MAX_CA_FILE'])
+            if not ca_path.is_absolute():
+                ca_path = ROOT / ca_path
+            max_ctx.load_verify_locations(cafile=str(ca_path))
+        # Additional MAX trust is scoped to MAX requests; Telegram keeps default roots.
+        self.max_opener = urllib.request.build_opener(
+            SafeRedirect(), urllib.request.HTTPSHandler(context=max_ctx))
+
+    def request(self, service, path, method='GET', query=None, body=None, upload=None):
+        if service == 'tg':
+            url = 'https://api.telegram.org/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + path
+            headers = {}
+        elif service == 'max':
+            url = MAX_API + path
+            headers = {'Authorization': self.cfg['MAX_BOT_TOKEN']}
+        else:
+            check_media_url(path)
+            url, headers = path, {}
+        if query:
+            url += '?' + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
+        if upload:
+            data, mime = upload
+            headers['Content-Type'] = mime
+        elif body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode()
+            headers['Content-Type'] = 'application/json'
+        else:
+            data = None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            opener = self.opener if service == 'tg' else self.max_opener
+            with opener.open(req, timeout=25) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+                if len(raw) > 2 * 1024 * 1024:
+                    raise TransportError('Слишком большой ответ API')
+        except urllib.error.HTTPError as exc:
+            # Response descriptions/URLs can contain tokens. Never include them in errors.
+            try:
+                err = json.loads(exc.read(65536))
+            except (ValueError, OSError):
+                err = {}
+            code = err.get('error_code', err.get('code', exc.code))
+            if not isinstance(code, (str, int)) or len(str(code)) > 64:
+                code = exc.code
+            # Only documented machine codes or numeric status codes reach logs.
+            if str(code) not in ('attachment.not.ready',) and not str(code).isdigit():
+                code = exc.code
+            retry = err.get('parameters', {}).get('retry_after', 0)
+            raise ApiError(service, code, retry) from None
+        except (OSError, urllib.error.URLError, TimeoutError):
+            raise TransportError(f'{service}: ошибка соединения или TLS') from None
+        try:
+            result = json.loads(raw)
+        except ValueError:
+            raise TransportError(f'{service}: не удалось разобрать ответ API') from None
+        if not isinstance(result, dict):
+            raise TransportError(f'{service}: неожиданный формат ответа')
+        if service == 'tg':
+            if not result.get('ok'):
+                raise ApiError(service, result.get('error_code', 400),
+                               result.get('parameters', {}).get('retry_after', 0))
+            return result['result']
+        return result
+
+    def download(self, platform, reference):
+        if platform == 'tg':
+            info = self.request('tg', 'getFile', query={'file_id': reference})
+            if info.get('file_size', 0) > PHOTO_LIMIT:
+                raise BridgeError('Картинка превышает предел PoC 10 MiB')
+            file_path = info.get('file_path', '')
+            if not file_path or '..' in file_path.split('/'):
+                raise BridgeError('Не получен безопасный путь картинки Telegram')
+            url = 'https://api.telegram.org/file/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + file_path
+        else:
+            url = reference
+            check_media_url(url)
+        try:
+            opener = self.opener if platform == 'tg' else self.max_opener
+            with opener.open(url, timeout=25) as response:
+                data = response.read(PHOTO_LIMIT + 1)
+                mime = response.headers.get_content_type()
+        except (OSError, urllib.error.URLError, TimeoutError):
+            raise TransportError('Не удалось скачать картинку') from None
+        if len(data) > PHOTO_LIMIT:
+            raise BridgeError('Картинка превышает предел PoC 10 MiB')
+        # Telegram's file server may return application/octet-stream for photos.
+        # Recognize supported image signatures rather than trusting that header.
+        if data.startswith(b'\xff\xd8\xff'):
+            mime = 'image/jpeg'
+        elif data.startswith(b'\x89PNG\r\n\x1a\n'):
+            mime = 'image/png'
+        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+            mime = 'image/webp'
+        else:
+            raise BridgeError('Для PoC поддерживаются картинки JPEG, PNG и WEBP')
+        return data, mime
+
+    def prepare_photo(self, source, reference, destination):
+        data, mime = self.download(source, reference)
+        filename = 'image' + (mimetypes.guess_extension(mime) or '.jpg')
+        if destination == 'tg':
+            return data, mime, filename
+        endpoint = self.request('max', '/uploads', method='POST', query={'type': 'image'})
+        uploaded = self.request('media', endpoint['url'], method='POST',
+                                upload=multipart({}, 'data', data, filename, mime))
+        if uploaded.get('photos'):
+            return {'photos': uploaded['photos']}
+        token = uploaded.get('token') or endpoint.get('token')
+        if token:
+            return {'token': token}
+        raise BridgeError('Ответ загрузки MAX не содержит токен картинки')
+
+
+def split_text(text, limit=3500):
+    """Telegram counts UTF-16 units; keep astral emoji within the same limit too."""
+    result, current, size = [], [], 0
+    for char in text:
+        units = 2 if ord(char) > 0xffff else 1
+        if size + units > limit:
+            result.append(''.join(current))
+            current, size = [], 0
+        current.append(char)
+        size += units
+    if current:
+        result.append(''.join(current))
+    return result
+
+
+def normalize(platform, event, chat_id, own_id):
+    if platform == 'tg':
+        msg = event.get('message')
+        if not msg or str(msg.get('chat', {}).get('id')) != str(chat_id):
+            return None
+        sender = msg.get('from', {})
+        if str(sender.get('id')) == str(own_id):
+            return None
+        author = msg.get('sender_chat') or sender
+        name = author.get('title') or ' '.join(filter(None, [author.get('first_name'), author.get('last_name')])) or 'Участник'
+        text = msg.get('text') or msg.get('caption') or ''
+        photos = msg.get('photo') or []
+        images = [max(photos, key=lambda p: (p.get('file_size', 0), p.get('width', 0)))['file_id']] if photos else []
+        reply = msg.get('reply_to_message') or {}
+        parent, quote = reply.get('message_id'), reply.get('text') or reply.get('caption') or ''
+        unsupported = any(k in msg for k in ('video', 'document', 'voice', 'audio', 'sticker', 'animation', 'poll', 'contact', 'location', 'video_note'))
+        mid = msg['message_id']
+    else:
+        if event.get('update_type') != 'message_created':
+            return None
+        msg = event.get('message') or {}
+        if str(msg.get('recipient', {}).get('chat_id')) != str(chat_id):
+            return None
+        sender = msg.get('sender') or {}
+        if str(sender.get('user_id')) == str(own_id):
+            return None
+        name = ' '.join(filter(None, [sender.get('first_name'), sender.get('last_name')])) or sender.get('name') or 'Участник'
+        body = msg.get('body') or {}
+        mid, text = body.get('mid'), body.get('text') or ''
+        attachments = body.get('attachments') or []
+        images = [a.get('payload', {}).get('url') for a in attachments if a.get('type') == 'image']
+        if any(not image for image in images):
+            raise BridgeError('В событии MAX отсутствует URL картинки')
+        unsupported = any(a.get('type') != 'image' for a in attachments)
+        link = msg.get('link') or {}
+        reply = link.get('message') or {} if link.get('type') == 'reply' else {}
+        parent, quote = reply.get('mid'), reply.get('text') or ''
+    if mid is None or not (text or images or unsupported):
+        return None
+    # No rich HTML/Markdown: sender names and message text remain plain text.
+    name = ' '.join(name.split())[:100]
+    return {'platform': platform, 'chat': str(chat_id), 'mid': str(mid), 'name': name,
+            'text': text, 'images': images, 'parent': str(parent) if parent is not None else None,
+            'quote': quote[:250], 'unsupported': unsupported}
+
+
+def units(message):
+    label = 'Telegram' if message['platform'] == 'tg' else 'MAX'
+    text = f"{message['name']} · {label}\n{message['text']}"
+    if message['quote']:
+        text += '\n\nВ ответ на: ' + message['quote']
+    if message['unsupported']:
+        text += '\n[Вложение вне объёма теста не перенесено]'
+    # The first photo carries a short caption; long text is delivered as separate pieces.
+    chunks = split_text(text, 900 if message['images'] else 3500)
+    result = []
+    if message['images']:
+        result.append({'kind': 'photo', 'text': chunks.pop(0), 'reference': message['images'][0]})
+        result.extend({'kind': 'text', 'text': part} for part in chunks)
+        result.extend({'kind': 'photo', 'text': f"{message['name']} · {label}", 'reference': ref}
+                      for ref in message['images'][1:])
+    else:
+        result.extend({'kind': 'text', 'text': part} for part in chunks)
+    return result
+
+
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript('''
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS inbox(
+                platform TEXT, chat TEXT, mid TEXT, PRIMARY KEY(platform,chat,mid));
+            CREATE TABLE IF NOT EXISTS jobs(
+                id INTEGER PRIMARY KEY, source TEXT, chat TEXT, mid TEXT, destination TEXT,
+                part INTEGER, payload TEXT, parent TEXT, state TEXT DEFAULT 'pending',
+                remote_id TEXT, attempts INTEGER DEFAULT 0, ready REAL DEFAULT 0,
+                error TEXT, UNIQUE(source,chat,mid,part));
+        ''')
+
+    def get(self, key):
+        row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+        return row[0] if row else None
+
+    def set(self, key, value):
+        self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key, str(value)))
+
+    def accept(self, platform, events, cursor, chat_id, own_id):
+        # The cursor and jobs commit together; a crash cannot acknowledge an unrecorded message.
+        with self.db:
+            for event in events:
+                message = normalize(platform, event, chat_id, own_id)
+                if message is None:
+                    continue
+                inserted = self.db.execute('INSERT OR IGNORE INTO inbox VALUES(?,?,?)',
+                                           (platform, message['chat'], message['mid'])).rowcount
+                if not inserted:
+                    continue
+                destination = 'max' if platform == 'tg' else 'tg'
+                for i, part in enumerate(units(message)):
+                    self.db.execute('''INSERT INTO jobs(source,chat,mid,destination,part,payload,parent)
+                                       VALUES(?,?,?,?,?,?,?)''',
+                                    (platform, message['chat'], message['mid'], destination,
+                                     i, json.dumps(part, ensure_ascii=False), message['parent']))
+            if cursor is not None:
+                self.set('cursor_' + platform, cursor)
+
+    def parent_id(self, job):
+        if not job['parent']:
+            return None
+        # Reply to a mirrored message: original is already local at the destination.
+        row = self.db.execute('''SELECT mid FROM jobs WHERE source=? AND destination=?
+                                 AND remote_id=? AND state='sent' ORDER BY id LIMIT 1''',
+                              (job['destination'], job['source'], job['parent'])).fetchone()
+        if row:
+            return row[0]
+        row = self.db.execute('''SELECT remote_id FROM jobs WHERE source=? AND chat=? AND mid=?
+                                 AND state='sent' ORDER BY part LIMIT 1''',
+                              (job['source'], job['chat'], job['parent'])).fetchone()
+        return row[0] if row else None
+
+    def update(self, jid, state, error=None, remote_id=None, delay=0):
+        with self.db:
+            self.db.execute('''UPDATE jobs SET state=?,error=?,remote_id=?,ready=?,attempts=attempts+1
+                               WHERE id=?''', (state, error, remote_id, time.time() + delay, jid))
+
+    def recover(self):
+        with self.db:
+            self.db.execute("UPDATE jobs SET state='uncertain',error='Процесс остановился при отправке' WHERE state='sending'")
+
+
+class Bridge:
+    def __init__(self, cfg, api, store, ids):
+        self.cfg, self.api, self.store, self.ids = cfg, api, store, ids
+
+    def poll(self, platform):
+        cursor = self.store.get('cursor_' + platform)
+        if platform == 'tg':
+            events = self.api.request('tg', 'getUpdates', method='POST', body={
+                'offset': int(cursor) if cursor is not None else None,
+                'timeout': 0, 'allowed_updates': ['message']})
+            next_cursor = max(e['update_id'] for e in events) + 1 if events else cursor
+        else:
+            result = self.api.request('max', '/updates', query={
+                'marker': cursor, 'timeout': 0, 'types': 'message_created', 'limit': 100})
+            events, next_cursor = result.get('updates', []), result.get('marker')
+        self.store.accept(platform, events, next_cursor, self.cfg[platform.upper() + '_CHAT_ID'], self.ids[platform])
+
+    def deliver(self, destination):
+        # Keep ordering; uncertain/failed publication blocks this destination until reviewed.
+        job = self.store.db.execute("SELECT * FROM jobs WHERE destination=? AND state!='sent' ORDER BY id LIMIT 1",
+                                    (destination,)).fetchone()
+        if not job or job['state'] != 'pending' or job['ready'] > time.time():
+            return
+        next_send = float(self.store.get('next_' + destination) or 0)
+        if time.time() < next_send:
+            return
+        part = json.loads(job['payload'])
+        target = self.cfg[destination.upper() + '_CHAT_ID']
+        parent = self.store.parent_id(job) if job['part'] == 0 else None
+        publishing = False
+        try:
+            photo = self.api.prepare_photo(job['source'], part['reference'], destination) if part['kind'] == 'photo' else None
+            # Commit before the first request that may publish a visible message.
+            self.store.update(job['id'], 'sending')
+            publishing = True
+            if destination == 'tg':
+                payload = {'chat_id': target}
+                if parent:
+                    payload['reply_parameters'] = {'message_id': int(parent), 'allow_sending_without_reply': True}
+                if photo:
+                    data, mime, filename = photo
+                    payload['caption'] = part['text']
+                    result = self.api.request('tg', 'sendPhoto', method='POST',
+                                              upload=multipart(payload, 'photo', data, filename, mime))
+                else:
+                    payload.update(text=part['text'], link_preview_options={'is_disabled': True})
+                    result = self.api.request('tg', 'sendMessage', method='POST', body=payload)
+                remote_id = str(result['message_id'])
+            else:
+                payload = {'text': part['text']}
+                if photo:
+                    payload['attachments'] = [{'type': 'image', 'payload': photo}]
+                if parent:
+                    payload['link'] = {'type': 'reply', 'mid': parent}
+                result = self.api.request('max', '/messages', method='POST', query={'chat_id': target}, body=payload)
+                remote_id = str(result['message']['body']['mid'])
+            self.store.update(job['id'], 'sent', remote_id=remote_id)
+            print(f"sent job={job['id']} {job['source']}->{destination}", flush=True)
+        except ApiError as exc:
+            # A definitive rejection is safe to retry. A server 5xx may be post-publication.
+            if exc.code in ('429', 'attachment.not.ready'):
+                state, delay = 'pending', max(float(exc.retry_after or 0), min(120, 2 ** min(job['attempts'] + 1, 6)))
+            elif exc.code.isdigit() and int(exc.code) >= 500:
+                state, delay = ('uncertain', 0) if publishing else ('pending', 30)
+            else:
+                state, delay = 'failed', 0
+            self.store.update(job['id'], state, str(exc), delay=delay)
+            print(f"{state} job={job['id']} {exc}", flush=True)
+        except TransportError as exc:
+            state = 'uncertain' if publishing else 'pending'
+            self.store.update(job['id'], state, str(exc), delay=30)
+            print(f"{state} job={job['id']} {exc}", flush=True)
+        except (KeyError, TypeError, ValueError):
+            state = 'uncertain' if publishing else 'failed'
+            self.store.update(job['id'], state, 'Неожиданный формат ответа API')
+            print(f"{state} job={job['id']} unexpected-response", flush=True)
+        except BridgeError as exc:
+            self.store.update(job['id'], 'failed', str(exc))
+            print(f"failed job={job['id']} {exc}", flush=True)
+        finally:
+            with self.store.db:
+                self.store.set('next_' + destination, time.time() + (3.2 if destination == 'tg' else 0.6))
+
+
+def doctor(cfg, api, chats=False):
+    tg = api.request('tg', 'getMe')
+    mx = api.request('max', '/me')
+    ids = {'tg': str(tg['id']), 'max': str(mx['user_id'])}
+    for platform, bot in [('tg', tg), ('max', mx)]:
+        expected = cfg.get(platform.upper() + '_BOT_USERNAME', '').lstrip('@').lower()
+        if expected and (bot.get('username') or '').lower() != expected:
+            raise BridgeError(f'{platform}: токен относится к другому боту; проверьте ожидаемый username')
+        print(f"{platform}: bot @{bot.get('username', '')}, id={ids[platform]}")
+    webhook = api.request('tg', 'getWebhookInfo')
+    subscriptions = api.request('max', '/subscriptions').get('subscriptions', [])
+    if webhook.get('url') or subscriptions:
+        raise BridgeError('У бота есть webhook-подписка. Нужна проверка перед переходом на тестовый polling; автоматически не отключаю.')
+    print('Webhook-подписок нет; тестовый polling доступен.')
+    if chats:
+        tg_chat = api.request('tg', 'getChat', query={'chat_id': cfg['TG_CHAT_ID']})
+        mx_chat = api.request('max', '/chats/' + cfg['MAX_CHAT_ID'])
+        if tg_chat.get('type') not in ('group', 'supergroup') or mx_chat.get('type') != 'chat':
+            raise BridgeError('Для PoC разрешены только групповые чаты')
+        member = api.request('tg', 'getChatMember', query={'chat_id': cfg['TG_CHAT_ID'], 'user_id': ids['tg']})
+        if member.get('status') not in ('administrator', 'creator') and not tg.get('can_read_all_group_messages'):
+            raise BridgeError('Telegram: нужен отключённый Privacy Mode или роль администратора')
+        if member.get('status') in ('left', 'kicked', 'restricted'):
+            raise BridgeError('Telegram: бот отсутствует или ограничен; проверьте разрешения')
+        permissions = tg_chat.get('permissions') or {}
+        if member.get('status') not in ('administrator', 'creator') and (
+                permissions.get('can_send_messages') is False or permissions.get('can_send_photos') is False):
+            raise BridgeError('Telegram: в группе запрещена отправка текста или фото')
+        mx_member = api.request('max', '/chats/' + cfg['MAX_CHAT_ID'] + '/members/me')
+        # In groups `write` grants moderation (edit/delete), not ordinary sending.
+        # https://dev.max.ru/docs-api/objects/ChatMember
+        if not mx_member.get('is_admin') or 'read_all_messages' not in (mx_member.get('permissions') or []):
+            raise BridgeError('MAX: нужны роль администратора и право read_all_messages')
+        print(f"Чаты проверены: Telegram {cfg['TG_CHAT_ID']}; MAX {cfg['MAX_CHAT_ID']}")
+    return ids
+
+
+def discover(cfg, api, seconds):
+    doctor(cfg, api)
+    code_file = STATE / 'discovery-code'
+    if not code_file.exists():
+        code_file.write_text('SYNC-CHECK-' + secrets.token_hex(3).upper())
+    code = code_file.read_text().strip()
+    print(f'Отправьте в обе тестовые группы сообщение: {code}', flush=True)
+    found, tg_cursor, mx_cursor = {}, None, None
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and len(found) < 2:
+        tg_events = api.request('tg', 'getUpdates', method='POST', body={'offset': tg_cursor, 'timeout': 0, 'allowed_updates': ['message']})
+        for event in tg_events:
+            msg = event.get('message') or {}
+            if msg.get('text') == code and msg.get('chat', {}).get('type') in ('group', 'supergroup'):
+                found['tg'] = str(msg['chat']['id'])
+        if tg_events:
+            tg_cursor = max(e['update_id'] for e in tg_events) + 1
+        mx = api.request('max', '/updates', query={'marker': mx_cursor, 'timeout': 0, 'types': 'message_created'})
+        mx_cursor = mx.get('marker')
+        for event in mx.get('updates', []):
+            msg = event.get('message') or {}
+            if (msg.get('body') or {}).get('text') == code and msg.get('recipient', {}).get('chat_type') == 'chat':
+                found['max'] = str(msg['recipient']['chat_id'])
+        if found:
+            (STATE / 'discovered.json').write_text(json.dumps(found))
+        time.sleep(1)
+    for platform, chat in found.items():
+        print(f'{platform}: test_chat_id={chat}')
+    if len(found) != 2:
+        raise BridgeError('Не обнаружены обе группы. Проверьте права и повторите команду discover.')
+    print('Обе группы найдены. Команда bind подключит только эти группы.')
+
+
+def bind():
+    found = json.loads((STATE / 'discovered.json').read_text())
+    if set(found) != {'tg', 'max'}:
+        raise BridgeError('Сначала обнаружьте обе группы через discover')
+    lines = ENV.read_text().splitlines()
+    for key, value in [('TG_CHAT_ID', found['tg']), ('MAX_CHAT_ID', found['max'])]:
+        prefix = key + '='
+        lines = [line for line in lines if not line.startswith(prefix)] + [prefix + str(int(value))]
+    ENV.write_text('\n'.join(lines) + '\n')
+    ENV.chmod(0o600)
+    print('ID двух тестовых групп записаны в .env; сообщения не отправлены.')
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status'])
+    parser.add_argument('--seconds', type=int, default=90)
+    args = parser.parse_args()
+    STATE.mkdir(mode=0o700, exist_ok=True)
+    if args.command == 'status':
+        if not (STATE / 'bridge.sqlite3').exists():
+            print('Очередь ещё не создана.')
+            return
+        store = Store(STATE / 'bridge.sqlite3')
+        for row in store.db.execute('SELECT destination,state,count(*) AS n FROM jobs GROUP BY destination,state'):
+            print(f"{row['destination']} {row['state']} {row['n']}")
+        for row in store.db.execute("SELECT id,destination,state,error FROM jobs WHERE state IN ('failed','uncertain','sending') ORDER BY id"):
+            print(f"job={row['id']} {row['destination']} {row['state']} {row['error'] or ''}")
+        return
+    # Discovery and run are exclusive; prevents two processes consuming the same streams.
+    with (STATE / 'process.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BridgeError('Другой процесс уже использует прототип') from None
+        if args.command == 'bind':
+            bind()
+            return
+        cfg = config(require_chats=args.command == 'run')
+        api = Api(cfg)
+        if args.command == 'discover':
+            discover(cfg, api, args.seconds)
+            return
+        ids = doctor(cfg, api, chats=bool(cfg.get('TG_CHAT_ID') and cfg.get('MAX_CHAT_ID')))
+        if args.command == 'doctor':
+            return
+        store = Store(STATE / 'bridge.sqlite3')
+        identity = json.dumps([ids['tg'], ids['max'], cfg['TG_CHAT_ID'], cfg['MAX_CHAT_ID']])
+        if store.get('identity') not in (None, identity):
+            raise BridgeError('База принадлежит другой паре ботов/чатов; используйте отдельное тестовое окружение')
+        with store.db:
+            store.set('identity', identity)
+        store.recover()
+        bridge = Bridge(cfg, api, store, ids)
+        stopping = False
+
+        def stop(_signum, _frame):
+            nonlocal stopping
+            stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        print('Тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
+        errors = {'tg': 0, 'max': 0}
+        while not stopping:
+            for platform in ('tg', 'max'):
+                try:
+                    bridge.poll(platform)
+                    errors[platform] = 0
+                except BridgeError as exc:
+                    errors[platform] += 1
+                    if errors[platform] == 1 or errors[platform] % 30 == 0:
+                        print(f'poll {platform}: {exc}', flush=True)
+                    if isinstance(exc, ApiError) and exc.code in ('401', '403', '409'):
+                        raise BridgeError(f'{platform}: остановка из-за авторизации, прав или другого poller') from None
+                bridge.deliver(platform)
+            time.sleep(1)
+        print('Остановлено. Очередь сохранена.', flush=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (BridgeError, FileNotFoundError) as exc:
+        # FileNotFoundError prints only the missing local path, never response/request URLs.
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
