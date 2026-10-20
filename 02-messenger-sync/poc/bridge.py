@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -24,6 +25,7 @@ ENV = ROOT / '.env'
 STATE = ROOT / '.state'
 MAX_API = 'https://platform-api2.max.ru'
 PHOTO_LIMIT = 10 * 1024 * 1024
+SCHEMA_VERSION = 2
 MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
                  'vkuserphoto.ru', 'vk-cdn.net')
 
@@ -372,16 +374,18 @@ def units(message):
 
 
 class Store:
-    def __init__(self, path):
-        self.db = sqlite3.connect(path)
+    def __init__(self, path, readonly=False):
+        self.db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True) if readonly else sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         version = self.db.execute('PRAGMA user_version').fetchone()[0]
-        if version > 1:
+        if version > SCHEMA_VERSION:
             self.db.close()
             raise BridgeError('База создана более новой версией программы')
+        if readonly:
+            return
         existing = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone()
-        if existing and version == 0 and str(path) != ':memory:':
-            backup_path = Path(str(path) + '.v0-' + secrets.token_hex(6) + '.bak')
+        if existing and version < SCHEMA_VERSION and str(path) != ':memory:':
+            backup_path = Path(str(path) + f'.v{version}-' + secrets.token_hex(6) + '.bak')
             backup = sqlite3.connect(backup_path)
             try:
                 self.db.backup(backup)
@@ -405,7 +409,11 @@ class Store:
                 state TEXT NOT NULL DEFAULT 'open', attempts INTEGER NOT NULL DEFAULT 0,
                 created REAL NOT NULL, updated REAL NOT NULL,
                 UNIQUE(platform,chat,event_key));
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS audit(
+                id INTEGER PRIMARY KEY, scope TEXT NOT NULL, target_id INTEGER NOT NULL,
+                action TEXT NOT NULL, old_state TEXT NOT NULL, new_state TEXT NOT NULL,
+                reason TEXT NOT NULL, created REAL NOT NULL);
+            PRAGMA user_version=2;
             COMMIT;
         ''')
 
@@ -415,6 +423,9 @@ class Store:
 
     def set(self, key, value):
         self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key, str(value)))
+
+    def has_table(self, name):
+        return self.db.execute('SELECT 1 FROM sqlite_master WHERE type=\'table\' AND name=?', (name,)).fetchone() is not None
 
     def accept(self, platform, events, cursor, chat_id, own_id):
         # Cursor, valid jobs and quarantined inputs commit together. DB/programming
@@ -452,7 +463,7 @@ class Store:
                            WHERE platform=? AND chat=? AND event_key=? AND state='open' ''',
                         (time.time(), platform, str(chat_id), event_key(platform, event)))
 
-    def retry_quarantine(self, qid, chat_id, own_id):
+    def retry_quarantine(self, qid, chat_id, own_id, reason='Повторная обработка после проверки'):
         with self.db:
             row = self.db.execute('SELECT * FROM quarantine WHERE id=?', (qid,)).fetchone()
             if row is None:
@@ -468,7 +479,80 @@ class Store:
                 self.db.execute('UPDATE quarantine SET error=?,updated=? WHERE id=?',
                                 (str(exc), time.time(), qid))
             self.db.execute('UPDATE quarantine SET attempts=attempts+1 WHERE id=?', (qid,))
+            state = self.db.execute('SELECT state FROM quarantine WHERE id=?', (qid,)).fetchone()[0]
+            self.audit('quarantine', qid, 'retry', row['state'], state, reason)
         return self.db.execute('SELECT state FROM quarantine WHERE id=?', (qid,)).fetchone()[0]
+
+    def audit(self, scope, target_id, action, old_state, new_state, reason):
+        self.db.execute('''INSERT INTO audit
+            (scope,target_id,action,old_state,new_state,reason,created) VALUES(?,?,?,?,?,?,?)''',
+            (scope, target_id, action, old_state, new_state, reason, time.time()))
+
+    def identity(self):
+        try:
+            ids = json.loads(self.get('identity') or 'null')
+        except ValueError:
+            ids = None
+        if not isinstance(ids, list) or len(ids) != 4 or not all(isinstance(v, str) and v for v in ids):
+            raise BridgeError('В базе нет проверенной привязки ботов и чатов; сначала выполните run')
+        return {'tg': (ids[0], ids[2]), 'max': (ids[1], ids[3])}
+
+    def manage_job(self, jid, action, reason, remote_id=None, accept_duplicate_risk=False, remaining=False):
+        if not reason or not reason.strip() or len(reason) > 1000:
+            raise BridgeError('Укажите причину действия длиной от 1 до 1000 символов')
+        with self.db:
+            # The CLI also owns process.lock: no publisher may be active during maintenance.
+            job = self.db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+            if job is None:
+                raise BridgeError('Задача не найдена')
+            old = job['state']
+            if old == 'sending':
+                raise BridgeError('Нельзя менять активно отправляемую задачу')
+            if action == 'retry':
+                if old == 'pending':
+                    return old
+                if old not in ('failed', 'uncertain'):
+                    raise BridgeError('Повтор разрешён только для failed или uncertain')
+                if old == 'uncertain' and not accept_duplicate_risk:
+                    raise BridgeError('Результат отправки неизвестен; после сверки нужен --accept-duplicate-risk')
+                self.db.execute("UPDATE jobs SET state='pending',error=NULL,ready=0 WHERE id=?", (jid,))
+                state = 'pending'
+            elif action == 'confirm':
+                if (not isinstance(remote_id, str) or not remote_id or len(remote_id) > 256
+                        or any(c.isspace() or not c.isprintable() for c in remote_id)
+                        or any(c in remote_id for c in '/?&#')):
+                    raise BridgeError('Укажите корректный ID опубликованной копии')
+                if job['destination'] == 'tg' and (not remote_id.isascii() or not remote_id.isdecimal() or int(remote_id) <= 0):
+                    raise BridgeError('ID копии Telegram должен быть положительным целым числом')
+                if old == 'sent' and job['remote_id'] == remote_id:
+                    return old
+                if old != 'uncertain':
+                    raise BridgeError('Подтверждать копию можно только для uncertain')
+                duplicate = self.db.execute('SELECT 1 FROM jobs WHERE destination=? AND remote_id=? AND id!=?',
+                                            (job['destination'], remote_id, jid)).fetchone()
+                if duplicate:
+                    raise BridgeError('Этот ID копии уже связан с другой задачей')
+                self.db.execute("UPDATE jobs SET state='sent',remote_id=?,error=NULL,ready=0 WHERE id=?", (remote_id, jid))
+                state = 'sent'
+            elif action == 'skip':
+                if old not in ('pending', 'failed', 'uncertain', 'skipped'):
+                    raise BridgeError('Нельзя пропустить уже доставленную задачу')
+                rows = [job]
+                if remaining:
+                    rows = self.db.execute('''SELECT * FROM jobs WHERE source=? AND chat=? AND mid=?
+                        AND part>=? AND state NOT IN ('sent','skipped') ORDER BY part''',
+                        (job['source'], job['chat'], job['mid'], job['part'])).fetchall()
+                    if any(row['state'] == 'sending' for row in rows):
+                        raise BridgeError('Одна из частей сообщения сейчас отправляется')
+                for row in rows:
+                    if row['state'] != 'skipped':
+                        self.db.execute("UPDATE jobs SET state='skipped',error=NULL,ready=0 WHERE id=?", (row['id'],))
+                        self.audit('job', row['id'], action, row['state'], 'skipped', reason)
+                return 'skipped'
+            else:
+                raise BridgeError('Неизвестное действие очереди')
+            self.audit('job', jid, action, old, state, reason)
+        return state
 
     def parent_id(self, job):
         if not job['parent']:
@@ -513,7 +597,7 @@ class Bridge:
 
     def deliver(self, destination):
         # Keep ordering; uncertain/failed publication blocks this destination until reviewed.
-        job = self.store.db.execute("SELECT * FROM jobs WHERE destination=? AND state!='sent' ORDER BY id LIMIT 1",
+        job = self.store.db.execute("SELECT * FROM jobs WHERE destination=? AND state NOT IN ('sent','skipped') ORDER BY id LIMIT 1",
                                     (destination,)).fetchone()
         if not job or job['state'] != 'pending' or job['ready'] > time.time():
             return
@@ -615,9 +699,9 @@ def doctor(cfg, api, chats=False):
     return ids
 
 
-def discover(cfg, api, seconds):
+def discover(cfg, api, seconds, state=STATE):
     doctor(cfg, api)
-    code_file = STATE / 'discovery-code'
+    code_file = state / 'discovery-code'
     if not code_file.exists():
         code_file.write_text('SYNC-CHECK-' + secrets.token_hex(3).upper())
     code = code_file.read_text().strip()
@@ -639,7 +723,7 @@ def discover(cfg, api, seconds):
             if (msg.get('body') or {}).get('text') == code and msg.get('recipient', {}).get('chat_type') == 'chat':
                 found['max'] = str(msg['recipient']['chat_id'])
         if found:
-            (STATE / 'discovered.json').write_text(json.dumps(found))
+            (state / 'discovered.json').write_text(json.dumps(found))
         time.sleep(1)
     for platform, chat in found.items():
         print(f'{platform}: test_chat_id={chat}')
@@ -648,8 +732,8 @@ def discover(cfg, api, seconds):
     print('Обе группы найдены. Команда bind подключит только эти группы.')
 
 
-def bind():
-    found = json.loads((STATE / 'discovered.json').read_text())
+def bind(state=STATE):
+    found = json.loads((state / 'discovered.json').read_text())
     if set(found) != {'tg', 'max'}:
         raise BridgeError('Сначала обнаружьте обе группы через discover')
     lines = ENV.read_text().splitlines()
@@ -661,43 +745,135 @@ def bind():
     print('ID двух тестовых групп записаны в .env; сообщения не отправлены.')
 
 
-def main():
-    os.umask(0o077)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status'])
-    parser.add_argument('--seconds', type=int, default=90)
-    args = parser.parse_args()
-    STATE.mkdir(mode=0o700, exist_ok=True)
-    if args.command == 'status':
-        if not (STATE / 'bridge.sqlite3').exists():
-            print('Очередь ещё не создана.')
-            return
-        store = Store(STATE / 'bridge.sqlite3')
-        for row in store.db.execute('SELECT destination,state,count(*) AS n FROM jobs GROUP BY destination,state'):
-            print(f"{row['destination']} {row['state']} {row['n']}")
-        for row in store.db.execute("SELECT id,destination,state,error FROM jobs WHERE state IN ('failed','uncertain','sending') ORDER BY id"):
-            print(f"job={row['id']} {row['destination']} {row['state']} {row['error'] or ''}")
-        for row in store.db.execute("SELECT id,platform,error FROM quarantine WHERE state='open' ORDER BY id"):
-            print(f"quarantine={row['id']} {row['platform']} {row['error']}")
-        return
-    # Discovery and run are exclusive; prevents two processes consuming the same streams.
-    with (STATE / 'process.lock').open('a') as lock:
+@contextmanager
+def process_lock(state):
+    with (state / 'process.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise BridgeError('Другой процесс уже использует прототип') from None
+            raise BridgeError('Другой процесс использует прототип; остановите его перед изменением очереди') from None
+        yield
+
+
+def queue_view(store, command, action, target_id=None, limit=100):
+    table = 'jobs' if command == 'queue' else 'quarantine'
+    fields = ('id,source,chat,mid,destination,part,parent,state,remote_id,attempts,ready,error'
+              if command == 'queue' else 'id,platform,chat,event_key,error,state,attempts,created,updated')
+    if not store.has_table(table):
+        return []
+    if action == 'list':
+        return [dict(row) for row in store.db.execute(f'SELECT {fields} FROM {table} ORDER BY id LIMIT ?', (limit,))]
+    row = store.db.execute(f'SELECT {fields} FROM {table} WHERE id=?', (target_id,)).fetchone()
+    if row is None:
+        raise BridgeError('Задача или событие не найдены')
+    result = dict(row)
+    if command == 'queue':
+        result['parts'] = [dict(part) for part in store.db.execute(
+            'SELECT id,part,state,remote_id FROM jobs WHERE source=? AND chat=? AND mid=? ORDER BY part',
+            (row['source'], row['chat'], row['mid']))]
+    result['audit'] = []
+    if store.has_table('audit'):
+        scope = 'job' if command == 'queue' else 'quarantine'
+        result['audit'] = [dict(entry) for entry in store.db.execute(
+            'SELECT action,old_state,new_state,created FROM audit WHERE scope=? AND target_id=? ORDER BY id',
+            (scope, target_id))]
+    return result
+
+
+def main(argv=None):
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status', 'queue', 'quarantine'])
+    parser.add_argument('action', nargs='?', choices=['list', 'show', 'retry', 'confirm', 'skip'])
+    parser.add_argument('id', nargs='?', type=int)
+    parser.add_argument('--seconds', type=int, default=90)
+    parser.add_argument('--state-dir', type=Path, default=STATE)
+    parser.add_argument('--limit', type=int, default=100)
+    parser.add_argument('--reason')
+    parser.add_argument('--remote-id')
+    parser.add_argument('--accept-duplicate-risk', action='store_true')
+    parser.add_argument('--remaining', action='store_true')
+    args = parser.parse_args(argv)
+    maintenance = args.command in ('queue', 'quarantine')
+    mutating = maintenance and args.action not in ('list', 'show')
+    if maintenance:
+        allowed = ('list', 'show', 'retry', 'confirm', 'skip') if args.command == 'queue' else ('list', 'show', 'retry')
+        if args.action not in allowed:
+            parser.error('Укажите допустимое действие очереди или карантина')
+        if (args.action == 'list' and args.id is not None) or (args.action != 'list' and (args.id is None or args.id <= 0)):
+            parser.error('Для действия нужен положительный ID; list выполняется без ID')
+        if args.limit <= 0 or args.limit > 1000:
+            parser.error('--limit должен быть от 1 до 1000')
+        if mutating and (not args.reason or not args.reason.strip() or len(args.reason) > 1000):
+            parser.error('Для изменения укажите --reason длиной от 1 до 1000 символов')
+        if (args.remote_id is not None and args.action != 'confirm') or (args.action == 'confirm' and not args.remote_id):
+            parser.error('--remote-id обязателен только для confirm')
+        if args.remaining and (args.command != 'queue' or args.action != 'skip'):
+            parser.error('--remaining разрешён только для queue skip')
+        if args.accept_duplicate_risk and (args.command != 'queue' or args.action != 'retry'):
+            parser.error('--accept-duplicate-risk разрешён только для queue retry')
+    elif args.action is not None or args.id is not None or args.reason or args.remote_id or args.remaining or args.accept_duplicate_risk:
+        parser.error('Действия и параметры очереди допустимы только для queue/quarantine')
+    state = args.state_dir
+    db_path = state / 'bridge.sqlite3'
+    if args.command == 'status' or (maintenance and not mutating):
+        if not db_path.exists():
+            if args.command == 'status':
+                print('Очередь ещё не создана.')
+                return
+            if args.action == 'list':
+                print('[]')
+                return
+            raise BridgeError('Очередь ещё не создана')
+        store = Store(db_path, readonly=True)
+        try:
+            store.db.execute('BEGIN')
+            if maintenance:
+                print(json.dumps(queue_view(store, args.command, args.action, args.id, args.limit), ensure_ascii=False, indent=2))
+                return
+            for row in store.db.execute('SELECT destination,state,count(*) AS n FROM jobs GROUP BY destination,state'):
+                print(f"{row['destination']} {row['state']} {row['n']}")
+            for row in store.db.execute("SELECT id,destination,state,error FROM jobs WHERE state IN ('failed','uncertain','sending') ORDER BY id"):
+                print(f"job={row['id']} {row['destination']} {row['state']} {row['error'] or ''}")
+            if store.has_table('quarantine'):
+                for row in store.db.execute("SELECT id,platform,error FROM quarantine WHERE state='open' ORDER BY id"):
+                    print(f"quarantine={row['id']} {row['platform']} {row['error']}")
+        finally:
+            store.db.close()
+        return
+    if mutating and not db_path.exists():
+        raise BridgeError('Очередь ещё не создана')
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with process_lock(state):
+        if mutating:
+            store = Store(db_path)
+            try:
+                store.recover()
+                if args.command == 'queue':
+                    result = store.manage_job(args.id, args.action, args.reason, args.remote_id,
+                                              args.accept_duplicate_risk, args.remaining)
+                else:
+                    row = store.db.execute('SELECT platform FROM quarantine WHERE id=?', (args.id,)).fetchone()
+                    if row is None:
+                        raise BridgeError('Событие карантина не найдено')
+                    own_id, chat_id = store.identity()[row['platform']]
+                    result = store.retry_quarantine(args.id, chat_id, own_id, args.reason)
+                print(f'{args.command} id={args.id} state={result}')
+            finally:
+                store.db.close()
+            return
         if args.command == 'bind':
-            bind()
+            bind(state)
             return
         cfg = config(require_chats=args.command == 'run')
         api = Api(cfg)
         if args.command == 'discover':
-            discover(cfg, api, args.seconds)
+            discover(cfg, api, args.seconds, state)
             return
         ids = doctor(cfg, api, chats=bool(cfg.get('TG_CHAT_ID') and cfg.get('MAX_CHAT_ID')))
         if args.command == 'doctor':
             return
-        store = Store(STATE / 'bridge.sqlite3')
+        store = Store(db_path)
         identity = json.dumps([ids['tg'], ids['max'], cfg['TG_CHAT_ID'], cfg['MAX_CHAT_ID']])
         if store.get('identity') not in (None, identity):
             raise BridgeError('База принадлежит другой паре ботов/чатов; используйте отдельное тестовое окружение')

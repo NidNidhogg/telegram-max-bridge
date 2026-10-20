@@ -1,4 +1,6 @@
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 import sqlite3
 from pathlib import Path
@@ -195,8 +197,126 @@ class BridgeTests(unittest.TestCase):
         self.store = b.Store(Path(self.tmp.name) / 'state.db')
         self.assertEqual(self.jobs()[0]['remote_id'], 'old-copy')
         self.assertEqual(self.store.get('cursor_tg'), '2')
-        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 1)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], b.SCHEMA_VERSION)
         self.assertEqual(len(list(Path(self.tmp.name).glob('state.db.v0-*.bak'))), 1)
+
+    def test_failed_retry_is_idempotent_and_unblocks_delivery(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'failed', 'rejected')
+        self.store.manage_job(1, 'retry', 'fixed')
+        self.store.manage_job(1, 'retry', 'fixed')
+        self.bridge(FakeApi()).deliver('max')
+        self.assertEqual(self.jobs()[0]['state'], 'sent')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 1)
+
+    def test_uncertain_retry_requires_explicit_duplicate_risk(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'uncertain')
+        with self.assertRaises(b.BridgeError):
+            self.store.manage_job(1, 'retry', 'reviewed')
+        self.assertEqual(self.jobs()[0]['state'], 'uncertain')
+        self.store.manage_job(1, 'retry', 'reviewed', accept_duplicate_risk=True)
+        self.assertEqual(self.jobs()[0]['state'], 'pending')
+
+    def test_manual_confirm_is_idempotent_and_restores_reply_mapping(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'uncertain')
+        for _ in range(2):
+            self.store.manage_job(1, 'confirm', 'found copy', remote_id='found-copy')
+        event = mx()
+        event['message']['link'] = {'type': 'reply', 'message': {'mid': 'found-copy'}}
+        self.store.accept('max', [event], 3, '-200', '88')
+        self.assertEqual(self.store.parent_id(self.jobs()[1]), '1')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 1)
+
+    def test_confirm_rejects_duplicate_or_invalid_remote_id(self):
+        self.store.accept('max', [mx('first'), mx('second')], 3, '-200', '88')
+        self.store.update(1, 'sent', remote_id='123')
+        self.store.update(2, 'uncertain')
+        for remote_id in ('123', '-1', 'not-a-number', 'https://secret.test/x'):
+            with self.subTest(remote_id=remote_id), self.assertRaises(b.BridgeError):
+                self.store.manage_job(2, 'confirm', 'reviewed', remote_id=remote_id)
+        self.assertEqual(self.jobs()[1]['state'], 'uncertain')
+
+    def test_skip_remaining_preserves_sent_prefix_and_other_messages(self):
+        self.store.accept('tg', [tg(1, text='x' * 9000), tg(2)], 3, '-100', '99')
+        self.store.update(1, 'sent', remote_id='prefix')
+        self.store.update(2, 'failed')
+        for _ in range(2):
+            self.store.manage_job(2, 'skip', 'approved omission', remaining=True)
+        self.assertEqual([j['state'] for j in self.jobs()], ['sent', 'skipped', 'skipped', 'pending'])
+        self.bridge(FakeApi()).deliver('max')
+        self.assertEqual(self.jobs()[3]['state'], 'sent')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 2)
+
+    def test_active_or_delivered_job_cannot_be_overwritten(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'sending')
+        for action in ('retry', 'skip', 'confirm'):
+            with self.subTest(action=action), self.assertRaises(b.BridgeError):
+                self.store.manage_job(1, action, 'reviewed', remote_id='copy')
+        self.store.update(1, 'sent', remote_id='original-copy')
+        with self.assertRaises(b.BridgeError):
+            self.store.manage_job(1, 'confirm', 'reviewed', remote_id='different-copy')
+
+    def test_audit_write_failure_rolls_back_operator_action(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'failed')
+        self.store.db.execute("""CREATE TRIGGER fail_audit BEFORE INSERT ON audit
+                               BEGIN SELECT RAISE(ABORT, 'injected'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.manage_job(1, 'retry', 'fixed')
+        self.assertEqual(self.jobs()[0]['state'], 'failed')
+
+    def test_cli_maintenance_is_offline_and_never_displays_payload(self):
+        self.store.accept('tg', [tg(text='PRIVATE_MESSAGE')], 2, '-100', '99')
+        self.store.update(1, 'uncertain')
+        self.store.db.close()
+        path = Path(self.tmp.name) / 'bridge.sqlite3'
+        (Path(self.tmp.name) / 'state.db').rename(path)
+        self.store = b.Store(path)
+        output = io.StringIO()
+        with patch.object(b, 'Api', side_effect=AssertionError('network forbidden')), redirect_stdout(output):
+            b.main(['queue', 'show', '1', '--state-dir', self.tmp.name])
+            b.main(['queue', 'confirm', '1', '--remote-id', 'found', '--reason', 'reviewed', '--state-dir', self.tmp.name])
+        self.assertNotIn('PRIVATE_MESSAGE', output.getvalue())
+        self.assertEqual(self.jobs()[0]['state'], 'sent')
+
+    def test_cli_mutation_is_rejected_while_bridge_holds_process_lock(self):
+        # Use the CLI's filename so it reaches the lock rather than a missing-DB error.
+        path = Path(self.tmp.name) / 'bridge.sqlite3'
+        other = b.Store(path)
+        other.db.close()
+        with b.process_lock(Path(self.tmp.name)):
+            with self.assertRaisesRegex(b.BridgeError, 'Другой процесс'):
+                b.main(['queue', 'skip', '1', '--reason', 'reviewed', '--state-dir', self.tmp.name])
+
+    def test_readonly_legacy_inspection_does_not_migrate_database(self):
+        self.store.db.execute('PRAGMA user_version=0')
+        self.store.db.commit()
+        reader = b.Store(Path(self.tmp.name) / 'state.db', readonly=True)
+        try:
+            self.assertEqual(reader.db.execute('PRAGMA user_version').fetchone()[0], 0)
+            self.assertEqual(b.queue_view(reader, 'queue', 'list'), [])
+        finally:
+            reader.db.close()
+        self.assertEqual(list(Path(self.tmp.name).glob('*.bak')), [])
+
+    def test_cli_quarantine_retry_uses_stored_identity(self):
+        path = Path(self.tmp.name) / 'bridge.sqlite3'
+        other = b.Store(path)
+        other.accept('max', [mx(text=[])], 3, '-200', '88')
+        with other.db:
+            other.set('identity', json.dumps(['99', '88', '-100', '-200']))
+        other.db.close()
+        with redirect_stdout(io.StringIO()), patch.object(b, 'Api', side_effect=AssertionError('network forbidden')):
+            b.main(['quarantine', 'retry', '1', '--reason', 'handler reviewed', '--state-dir', self.tmp.name])
+        other = b.Store(path)
+        try:
+            self.assertEqual(other.db.execute('SELECT attempts FROM quarantine').fetchone()[0], 1)
+            self.assertEqual(other.db.execute('SELECT scope FROM audit').fetchone()[0], 'quarantine')
+        finally:
+            other.db.close()
 
     def test_unknown_media_hosts_rejected(self):
         for url in ('http://i.oneme.ru/a', 'https://localhost/a', 'https://oneme.ru.evil.test/a',
