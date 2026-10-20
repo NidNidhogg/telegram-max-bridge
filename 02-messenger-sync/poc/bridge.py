@@ -150,10 +150,11 @@ def multipart(fields, field, data, filename, mime):
 
 class Api:
     """Bounded async transport; publication is never retried by this adapter."""
-    def __init__(self, cfg, *, tg_base=None, max_base=None, timeout=None):
+    def __init__(self, cfg, *, tg_base=None, max_base=None, tg_file_base=None, timeout=None):
         self.cfg = cfg
         self.tg_base = tg_base or 'https://api.telegram.org/bot' + cfg['TG_BOT_TOKEN']
         self.max_base = max_base or MAX_API
+        self.tg_file_base = tg_file_base or 'https://api.telegram.org/file/bot' + cfg['TG_BOT_TOKEN']
         self.timeout = timeout or aiohttp.ClientTimeout(total=25, connect=5, sock_read=20)
         self.contexts = {'tg': ssl.create_default_context(), 'max': ssl.create_default_context()}
         if cfg.get('MAX_CA_FILE'):
@@ -166,7 +167,8 @@ class Api:
             for platform in ('tg', 'max'):
                 connector = aiohttp.TCPConnector(ssl=self.contexts[platform], limit=6, limit_per_host=4)
                 self.sessions[platform] = aiohttp.ClientSession(connector=connector, timeout=self.timeout,
-                    cookie_jar=aiohttp.DummyCookieJar(), trust_env=False)
+                    cookie_jar=aiohttp.DummyCookieJar(), trust_env=False, auto_decompress=False,
+                    headers={'Accept-Encoding': 'identity'})
         except BaseException:
             await self.__aexit__(None, None, None)
             raise
@@ -259,7 +261,7 @@ class Api:
             file_path = info.get('file_path', '')
             if not file_path or '..' in file_path.split('/'):
                 raise BridgeError('Не получен безопасный путь картинки Telegram')
-            url = 'https://api.telegram.org/file/bot' + self.cfg['TG_BOT_TOKEN'] + '/' + file_path
+            url = self.tg_file_base + '/' + file_path
         else:
             check_media_url(reference)
             url = reference

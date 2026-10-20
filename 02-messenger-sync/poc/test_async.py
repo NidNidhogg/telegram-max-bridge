@@ -2,9 +2,13 @@
 import asyncio
 from contextlib import redirect_stdout
 import io
+import gzip
 import json
 from pathlib import Path
 import sqlite3
+import ssl
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -120,6 +124,14 @@ class HttpTests(HttpServer):
             with self.assertRaises(b.TransportError):
                 await api.request('max', '/messages', method='POST')
 
+    async def test_unrequested_compression_is_not_expanded_past_read_limit(self):
+        api = await self.api()
+        self.handler = lambda request, body: web.Response(
+            body=gzip.compress(b'x' * (2 * 1024 * 1024 + 1)), headers={'Content-Encoding': 'gzip'})
+        with self.assertRaises(b.TransportError):
+            await api.request('max', '/messages', method='POST')
+        self.assertEqual(self.calls[0][2]['Accept-Encoding'], 'identity')
+
     async def test_api_redirect_never_republishes(self):
         api = await self.api()
         self.handler = lambda request, body: web.Response(status=307, headers={'Location': self.url + '/other'})
@@ -185,6 +197,51 @@ class HttpTests(HttpServer):
         # Let timed-out synthetic server handlers finish before closing the listener.
         await asyncio.sleep(0.25)
 
+    async def test_additional_ca_is_scoped_to_max_and_hostname_is_verified(self):
+        if not shutil.which('openssl'):
+            self.skipTest('openssl is needed to generate an ephemeral TLS test certificate')
+        with tempfile.TemporaryDirectory() as temp:
+            key, cert = Path(temp) / 'key.pem', Path(temp) / 'cert.pem'
+            await asyncio.to_thread(subprocess.run, ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                '-keyout', str(key), '-out', str(cert), '-subj', '/CN=127.0.0.1', '-days', '1',
+                '-addext', 'subjectAltName=IP:127.0.0.1'], check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            app = web.Application()
+            app.router.add_route('*', '/{path:.*}', self.dispatch)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            loop = asyncio.get_running_loop()
+            previous_handler = loop.get_exception_handler()
+
+            def expected_tls_rejection(loop, context):
+                if (isinstance(context.get('exception'), ConnectionResetError)
+                        and context.get('message') == 'Error on transport creation for incoming connection'):
+                    return
+                if previous_handler:
+                    previous_handler(loop, context)
+                else:
+                    loop.default_exception_handler(context)
+
+            loop.set_exception_handler(expected_tls_rejection)
+            try:
+                await web.TCPSite(runner, '127.0.0.1', 0, ssl_context=context).start()
+                port = runner.addresses[0][1]
+                base = f'https://127.0.0.1:{port}'
+                cfg = {'TG_BOT_TOKEN': 'synthetic', 'MAX_BOT_TOKEN': 'synthetic', 'MAX_CA_FILE': str(cert)}
+                async with b.Api(cfg, tg_base=base, max_base=base) as api:
+                    await api.request('max', '/me')
+                    with self.assertRaises(b.TransportError):
+                        await api.request('tg', 'getMe')
+                    api.max_base = f'https://localhost:{port}'
+                    with self.assertRaises(b.TransportError):
+                        await api.request('max', '/me')
+                await asyncio.sleep(0.05)
+            finally:
+                await runner.cleanup()
+                loop.set_exception_handler(previous_handler)
+
 
 class RuntimeTests(HttpServer):
     async def asyncSetUp(self):
@@ -206,7 +263,7 @@ class RuntimeTests(HttpServer):
             return web.json_response({'ok': True, 'result': []})
         if request.path == '/updates':
             return web.json_response({'updates': [], 'marker': 42})
-        if request.path == '/sendMessage':
+        if request.path in ('/sendMessage', '/sendPhoto'):
             return web.json_response({'ok': True, 'result': {'message_id': len(self.calls)}})
         return web.json_response({'message': {'body': {'mid': 'copy-' + str(len(self.calls))}}})
 
@@ -472,6 +529,81 @@ class RuntimeTests(HttpServer):
         self.assertEqual(sum(c[1] == '/sendMessage' for c in self.calls), 100)
         stop.set()
         await task
+
+    async def test_database_lock_is_bounded_and_does_not_acknowledge_batch(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.handler = lambda request, body: web.json_response({'ok': True, 'result': [tg(2)]})
+        lock = sqlite3.connect(Path(self.tmp.name) / 'bridge.sqlite3')
+        lock.execute('BEGIN IMMEDIATE')
+        loop = asyncio.get_running_loop()
+        previous_slow_threshold = loop.slow_callback_duration
+        loop.slow_callback_duration = 0.5  # This test deliberately waits for SQLite's 100ms bound.
+        started = time.monotonic()
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                await self.bridge.poll('tg')
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(self.store.get('cursor_tg'), '2')
+            self.assertEqual(self.store.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+            self.assertFalse(self.store.db.in_transaction)
+        finally:
+            lock.rollback()
+            lock.close()
+            loop.call_soon(setattr, loop, 'slow_callback_duration', previous_slow_threshold)
+
+    async def test_telegram_photo_to_max_keeps_reply_and_awaits_without_transaction(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.store.update(1, 'sent', remote_id='max-parent')
+        event = tg(2)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        event['message']['reply_to_message'] = {'message_id': 1, 'text': 'parent'}
+        self.store.accept('tg', [event], 3, '-100', '99')
+        self.client.tg_file_base = self.url + '/files'
+        self.original_media_check = b.check_media_url
+
+        def handle(request, body):
+            self.assertFalse(self.store.db.in_transaction)
+            if request.path == '/getFile':
+                return web.json_response({'ok': True, 'result': {'file_path': 'image.jpg'}})
+            if request.path == '/files/image.jpg':
+                return web.Response(body=b'\xff\xd8\xffphoto')
+            if request.path == '/uploads':
+                return web.json_response({'url': self.url + '/upload'})
+            if request.path == '/upload':
+                return web.json_response({'token': 'photo-token'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media):
+            await self.bridge.deliver('max')
+        self.assertEqual(self.state(2), 'sent')
+        payload = json.loads(next(c[3] for c in self.calls if c[1] == '/messages'))
+        self.assertEqual(payload['link'], {'type': 'reply', 'mid': 'max-parent'})
+        self.assertEqual(payload['attachments'][0]['payload'], {'token': 'photo-token'})
+
+    async def test_max_photo_to_telegram_keeps_reply_and_caption(self):
+        self.store.accept('max', [mx('1')], 1, '-200', '88')
+        self.store.update(1, 'sent', remote_id='75')
+        event = mx('2')
+        event['message']['body']['attachments'] = [{'type': 'image', 'payload': {'url': self.url + '/image'}}]
+        event['message']['link'] = {'type': 'reply', 'message': {'mid': '1', 'text': 'parent'}}
+        self.store.accept('max', [event], 2, '-200', '88')
+        self.original_media_check = b.check_media_url
+
+        def handle(request, body):
+            self.assertFalse(self.store.db.in_transaction)
+            if request.path == '/image':
+                return web.Response(body=b'\x89PNG\r\n\x1a\nsynthetic')
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media):
+            await self.bridge.deliver('tg')
+        self.assertEqual(self.state(2), 'sent')
+        payload = next(c[3] for c in self.calls if c[1] == '/sendPhoto')
+        self.assertIn(b'"message_id": 75', payload)
+        self.assertIn(b'\x89PNG\r\n\x1a\nsynthetic', payload)
+        self.assertIn(b'synthetic', payload)
 
 
 if __name__ == '__main__':

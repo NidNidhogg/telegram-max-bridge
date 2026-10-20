@@ -44,6 +44,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_photo_with_generic_mime_is_accepted(self):
         api = b.Api.__new__(b.Api)
         api.cfg = {'TG_BOT_TOKEN': 'test'}
+        api.tg_file_base = 'https://api.telegram.org/file/bottest'
         api.request = AsyncMock(return_value={'file_path': 'photos/test.jpg'})
         api.read = AsyncMock(return_value=(200, b'\xff\xd8\xfftest-photo'))
         self.assertEqual((await api.download('tg', 'test'))[1], 'image/jpeg')
@@ -51,6 +52,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_image_mime_does_not_allow_non_image_content(self):
         api = b.Api.__new__(b.Api)
         api.cfg = {'TG_BOT_TOKEN': 'test'}
+        api.tg_file_base = 'https://api.telegram.org/file/bottest'
         api.request = AsyncMock(return_value={'file_path': 'photos/test.jpg'})
         api.read = AsyncMock(return_value=(200, b'<html>error</html>'))
         with self.assertRaises(b.BridgeError):

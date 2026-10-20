@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import sqlite3
+import resource
 import sys
 import tempfile
 import time
@@ -131,8 +132,10 @@ async def runtime_smoke(outage_seconds=0):
             assert not stderr, stderr.decode()
 
         child = await start()
+        started = time.monotonic()
         try:
             await until(lambda: snapshot()[0].get('sent') == 40)
+            delivery_seconds = time.monotonic() - started
             assert publications.count('/tg/sendMessage') == publications.count('/max/messages') == 20
             if outage_seconds:
                 tg_release.clear()
@@ -157,6 +160,8 @@ async def runtime_smoke(outage_seconds=0):
                 assert publications.count('/max/messages') == 21
                 print(f'Outage OK: {outage_seconds}s MAX failure, live Telegram/heartbeat, recovery, uncertain not retried')
             await stop(child)
+            rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            rss_mib = rss / (1024 * 1024 if sys.platform == 'darwin' else 1024)
             before = list(publications)
             child = await start()
             await until(lambda: snapshot()[1].get('runtime_state') == 'running')
@@ -165,6 +170,7 @@ async def runtime_smoke(outage_seconds=0):
             await stop(child)
             assert snapshot()[1]['runtime_state'] == 'stopped'
             print('Async CLI OK: 20 texts each way via HTTP, durable restart without duplicates, clean SIGTERM')
+            print(f'Synthetic CLI metrics: first 40 deliveries {delivery_seconds:.3f}s; child peak RSS {rss_mib:.1f} MiB (send intervals disabled)')
         finally:
             tg_release.set()
             if child.returncode is None:
