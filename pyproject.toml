@@ -1,0 +1,9 @@
+[project]
+name = "telegram-max-bridge"
+version = "0.1.0"
+description = "Durable single-pair Telegram/MAX group bridge"
+requires-python = ">=3.11"
+dependencies = ["aiohttp==3.14.5"]
+
+[tool.uv]
+package = false

@@ -16,11 +16,12 @@
 
 ## Проверки без токенов
 
-Python 3.11+ на macOS/Linux, только стандартная библиотека для самого моста. RTK в примерах — локальная обёртка команд; без неё можно убрать `rtk proxy`.
+Python 3.11+ на macOS/Linux. Текущий синхронный runtime использует стандартную библиотеку; для разрабатываемой async-версии и HTTP-тестов добавлено окружение `aiohttp`, воспроизводимое через `uv sync --locked`. RTK в примерах — локальная обёртка команд; без неё можно убрать `rtk proxy`.
 
 ```sh
-rtk proxy python3 -m unittest discover -s 02-messenger-sync/poc -p 'test_*.py' -v
-rtk proxy python3 02-messenger-sync/poc/smoke_p0.py
+rtk proxy uv sync --locked
+rtk proxy uv run --locked python -m unittest discover -s 02-messenger-sync/poc -p 'test_*.py' -v
+rtk proxy uv run --locked python 02-messenger-sync/poc/smoke_p0.py
 ```
 
 Сквозной прогон использует временные базы, настоящий CLI и отдельные процессы с подменённым API. Он не обращается к Telegram/MAX и не изменяет рабочую очередь.
@@ -45,6 +46,8 @@ rtk proxy python3 02-messenger-sync/poc/smoke_p0.py
 | [Живой запуск и ручной тест 20.10.2026](02-messenger-sync/poc/LIVE-TEST-2026-10-20.md) | Проверка обновлённого кода на тестовых ботах |
 | [Первичная живая проверка 19.10.2026](02-messenger-sync/poc/LIVE-TEST-2026-10-19.md) | Исторический протокол базовых сценариев |
 | [План реализации](02-messenger-sync/IMPLEMENTATION-PLAN.md) | Выполненный P0 и следующие приоритеты |
+| [План асинхронности](02-messenger-sync/ASYNC-IMPLEMENTATION-PLAN.md) | Следующий этап P1.1: независимые обработчики на asyncio/aiohttp, тесты и откат |
+| [План внедрения SDK](02-messenger-sync/LIBRARY-INTEGRATION-PLAN.md) | Отложенный вариант перехода на aiogram/maxapi при подтверждённой пользе |
 | [План сервера](02-messenger-sync/poc/SERVER-DEPLOYMENT-PLAN.md) | Будущее размещение и переход на webhook |
 | [Матрица возможностей](02-messenger-sync/01-research/01-capability-matrix.md) | Исследование платформ; VK оставлен как справка |
 | [Техническое заключение](02-messenger-sync/01-research/02-technical-conclusion.md) | Исходные выводы и границы проекта |
@@ -52,4 +55,4 @@ rtk proxy python3 02-messenger-sync/poc/smoke_p0.py
 | [План эксперимента](02-messenger-sync/01-research/04-poc-proposal.md) | Расширенные сценарии приёмки |
 | [Сценарий демо](02-messenger-sync/poc/DEMO-VIDEO-SCENARIO.md) | Показ тестового обмена |
 
-Внешние источники исследования относятся к проверке 19.10.2026; обновление статуса проекта 20.10.2026 не означает повторную проверку всех API и правил платформ. Вспомогательные скрипты `demo-video` требуют Pillow, ffmpeg и macOS-компонентов; готовые записи и кадры демонстрации в Git не включены.
+Исходное исследование платформ выполнено 19.10.2026. Для планов асинхронности и SDK отдельно проверены источники 20.10.2026; это не означает повторную проверку всех API и правил платформ. Вспомогательные скрипты `demo-video` требуют Pillow, ffmpeg и macOS-компонентов; готовые записи и кадры демонстрации в Git не включены.
