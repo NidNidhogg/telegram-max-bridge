@@ -233,7 +233,7 @@ class BridgeTests(unittest.TestCase):
         self.store.accept('max', [mx('first'), mx('second')], 3, '-200', '88')
         self.store.update(1, 'sent', remote_id='123')
         self.store.update(2, 'uncertain')
-        for remote_id in ('123', '-1', 'not-a-number', 'https://secret.test/x'):
+        for remote_id in ('123', '00123', '-1', 'not-a-number', 'https://secret.test/x'):
             with self.subTest(remote_id=remote_id), self.assertRaises(b.BridgeError):
                 self.store.manage_job(2, 'confirm', 'reviewed', remote_id=remote_id)
         self.assertEqual(self.jobs()[1]['state'], 'uncertain')
@@ -324,6 +324,186 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(b.BridgeError):
                 b.check_media_url(url)
         b.check_media_url('https://i.oneme.ru/image')
+
+    def healthy_telemetry(self, now=1000):
+        with self.store.db:
+            self.store.set('runtime_state', 'running')
+            self.store.set('run_started', now - 500)
+            self.store.set('heartbeat', now)
+            for platform in ('tg', 'max'):
+                self.store.set('last_poll_success_' + platform, now)
+                self.store.set('last_poll_error_' + platform, '')
+
+    def test_empty_queue_is_healthy_after_successful_empty_polls(self):
+        self.healthy_telemetry()
+        snapshot = b.health_snapshot(self.store, now=1000, running=True)
+        self.assertTrue(snapshot['ok'])
+        self.assertEqual(snapshot['platforms']['tg']['delivery']['counts'], {})
+        self.assertIsNone(snapshot['platforms']['max']['delivery']['last_success_at'])
+
+    def test_poll_failure_and_recovery_are_persisted_per_platform(self):
+        now = b.time.time()
+        self.healthy_telemetry(now)
+        with self.assertRaises(b.TransportError):
+            self.bridge(FakeApi(b.TransportError('synthetic'))).poll('tg')
+        failed = b.health_snapshot(self.store, running=True)
+        self.assertEqual([i['key'] for i in failed['issues']], ['poll:tg'])
+        api = MagicMock()
+        api.request.return_value = []
+        self.bridge(api).poll('tg')
+        self.assertTrue(b.health_snapshot(self.store, running=True)['ok'])
+
+    def test_fresh_heartbeat_does_not_hide_stopped_process(self):
+        self.healthy_telemetry()
+        snapshot = b.health_snapshot(self.store, now=1000, running=False)
+        self.assertEqual([i['code'] for i in snapshot['issues']], ['process_stopped'])
+
+    def test_stale_heartbeat_and_poll_are_unhealthy_even_with_process_lock(self):
+        self.healthy_telemetry()
+        snapshot = b.health_snapshot(self.store, now=1300, running=True, stale_after=180)
+        self.assertEqual({i['code'] for i in snapshot['issues']}, {'heartbeat_stale', 'poll_stale'})
+
+    def test_queue_age_and_blocking_job_are_visible_without_payload(self):
+        self.store.accept('tg', [tg(text='PRIVATE_BODY')], 2, '-100', '99')
+        self.store.update(1, 'failed', 'PRIVATE_ERROR')
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET created=600')
+        self.healthy_telemetry()
+        snapshot = b.health_snapshot(self.store, now=1000, running=True, queue_age=300)
+        self.assertEqual({i['code'] for i in snapshot['issues']}, {'delivery_blocked', 'queue_too_old'})
+        self.assertEqual(snapshot['platforms']['max']['delivery']['oldest_unresolved_age_seconds'], 400)
+        self.assertNotIn('PRIVATE', json.dumps(snapshot))
+
+    def test_unknown_legacy_queue_age_is_not_fabricated(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET created=NULL,updated=NULL')
+        self.healthy_telemetry()
+        snapshot = b.health_snapshot(self.store, now=1000, running=True)
+        self.assertEqual([i['code'] for i in snapshot['issues']], ['queue_age_unknown'])
+        self.assertIsNone(snapshot['platforms']['max']['delivery']['oldest_pending_age_seconds'])
+
+    def test_actual_old_schema_gains_timestamps_and_preserves_backup(self):
+        path = Path(self.tmp.name) / 'legacy.sqlite3'
+        db = sqlite3.connect(path)
+        db.executescript('''CREATE TABLE jobs(
+            id INTEGER PRIMARY KEY,source TEXT,chat TEXT,mid TEXT,destination TEXT,part INTEGER,
+            payload TEXT,parent TEXT,state TEXT DEFAULT 'pending',remote_id TEXT,
+            attempts INTEGER DEFAULT 0,ready REAL DEFAULT 0,error TEXT,UNIQUE(source,chat,mid,part));
+            INSERT INTO jobs(source,chat,mid,destination,part,payload) VALUES('tg','-100','1','max',0,'{}');
+            PRAGMA user_version=2;''')
+        db.close()
+        migrated = b.Store(path)
+        try:
+            row = migrated.db.execute('SELECT * FROM jobs').fetchone()
+            self.assertIsNone(row['created'])
+            self.assertEqual(row['state'], 'pending')
+            backup_path = next(Path(self.tmp.name).glob('legacy.sqlite3.v2-*.bak'))
+            backup = sqlite3.connect(backup_path)
+            try:
+                self.assertNotIn('created', [c[1] for c in backup.execute('PRAGMA table_info(jobs)')])
+                self.assertEqual(backup.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+            finally:
+                backup.close()
+        finally:
+            migrated.db.close()
+
+    def test_delivery_success_timestamp_is_recorded_with_sent_job(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.bridge(FakeApi()).deliver('max')
+        self.assertIsNotNone(self.store.get('last_delivery_success_max'))
+        self.assertIsNone(self.store.get('last_delivery_success_tg'))
+
+    def test_monitor_emits_problem_once_across_restart_and_one_recovery(self):
+        self.healthy_telemetry()
+        monitor_path = Path(self.tmp.name) / 'monitor.sqlite3'
+        monitor = b.AlertMonitor(monitor_path)
+        emitted = []
+        self.store.poll_failure('tg', b.TransportError('PRIVATE_TOKEN_OR_URL'))
+        failed = b.health_snapshot(self.store, now=1000, running=True)
+        monitor.observe(failed)
+        self.assertEqual(monitor.flush(emitted.append), 1)
+        monitor.db.close()
+        monitor = b.AlertMonitor(monitor_path)
+        try:
+            repeated = b.health_snapshot(self.store, now=1001, running=True)
+            monitor.observe(repeated)
+            self.assertEqual(monitor.flush(emitted.append), 0)
+            self.healthy_telemetry()
+            monitor.observe(b.health_snapshot(self.store, now=1000, running=True))
+            self.assertEqual(monitor.flush(emitted.append), 1)
+            monitor.observe(b.health_snapshot(self.store, now=1001, running=True))
+            self.assertEqual(monitor.flush(emitted.append), 0)
+            self.assertEqual([a['kind'] for a in emitted], ['problem', 'recovery'])
+            self.assertNotIn('PRIVATE', json.dumps(emitted))
+        finally:
+            monitor.db.close()
+
+    def test_monitor_preserves_alert_when_sink_fails(self):
+        path = Path(self.tmp.name) / 'monitor.sqlite3'
+        monitor = b.AlertMonitor(path)
+        monitor.observe(b.health_snapshot(None, now=1000))
+        event_id = monitor.db.execute('SELECT event_id FROM alerts').fetchone()[0]
+        with self.assertRaises(OSError):
+            monitor.flush(MagicMock(side_effect=OSError('sink unavailable')))
+        monitor.db.close()
+        monitor = b.AlertMonitor(path)
+        try:
+            monitor.observe(b.health_snapshot(None, now=1001))
+            emitted = []
+            self.assertEqual(monitor.flush(emitted.append), 1)
+            self.assertEqual(emitted[0]['event_id'], event_id)
+        finally:
+            monitor.db.close()
+
+    def test_unreadable_state_does_not_falsely_resolve_known_problems(self):
+        monitor = b.AlertMonitor(':memory:')
+        try:
+            self.healthy_telemetry()
+            self.store.poll_failure('tg', b.TransportError('synthetic'))
+            monitor.observe(b.health_snapshot(self.store, now=1000, running=True))
+            emitted = []
+            monitor.flush(emitted.append)
+            monitor.observe(b.health_snapshot(None, now=1001))
+            monitor.flush(emitted.append)
+            self.assertEqual([a['kind'] for a in emitted], ['problem', 'problem'])
+            self.healthy_telemetry()
+            monitor.observe(b.health_snapshot(self.store, now=1002, running=True))
+            monitor.flush(emitted.append)
+            self.assertEqual([a['kind'] for a in emitted], ['problem', 'problem', 'recovery', 'recovery'])
+        finally:
+            monitor.db.close()
+
+    def test_missing_state_health_is_machine_readable_and_nonzero(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = b.main(['health', '--json', '--state-dir', str(Path(self.tmp.name) / 'missing')])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(output.getvalue())['issues'][0]['code'], 'state_missing')
+        self.assertFalse((Path(self.tmp.name) / 'missing').exists())
+
+    def test_monitor_once_is_quiet_on_unchanged_state(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            b.main(['monitor', '--once', '--state-dir', self.tmp.name])
+            b.main(['monitor', '--once', '--state-dir', self.tmp.name])
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['kind'], 'problem')
+
+    def test_corrupt_state_is_reported_without_raw_database_error(self):
+        path = Path(self.tmp.name) / 'bridge.sqlite3'
+        path.write_text('PRIVATE_DATABASE_CONTENT')
+        snapshot = b.read_health(Path(self.tmp.name))
+        self.assertEqual(snapshot['issues'][0]['code'], 'state_unavailable')
+        self.assertNotIn('PRIVATE', json.dumps(snapshot))
+
+    def test_live_process_lock_is_detected_and_released(self):
+        state = Path(self.tmp.name)
+        self.assertFalse(b.bridge_running(state))
+        with b.process_lock(state):
+            self.assertTrue(b.bridge_running(state))
+        self.assertFalse(b.bridge_running(state))
 
     def test_ambiguous_publish_is_not_retried_and_blocks_destination(self):
         self.store.accept('tg', [tg(1), tg(2)], 3, '-100', '99')

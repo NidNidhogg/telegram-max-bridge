@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -25,7 +26,7 @@ ENV = ROOT / '.env'
 STATE = ROOT / '.state'
 MAX_API = 'https://platform-api2.max.ru'
 PHOTO_LIMIT = 10 * 1024 * 1024
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
                  'vkuserphoto.ru', 'vk-cdn.net')
 
@@ -376,6 +377,19 @@ def units(message):
 class Store:
     def __init__(self, path, readonly=False):
         self.db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True) if readonly else sqlite3.connect(path)
+        try:
+            self.initialize(path, readonly)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.db.close()
+
+    def initialize(self, path, readonly):
         self.db.row_factory = sqlite3.Row
         version = self.db.execute('PRAGMA user_version').fetchone()[0]
         if version > SCHEMA_VERSION:
@@ -402,7 +416,7 @@ class Store:
                 id INTEGER PRIMARY KEY, source TEXT, chat TEXT, mid TEXT, destination TEXT,
                 part INTEGER, payload TEXT, parent TEXT, state TEXT DEFAULT 'pending',
                 remote_id TEXT, attempts INTEGER DEFAULT 0, ready REAL DEFAULT 0,
-                error TEXT, UNIQUE(source,chat,mid,part));
+                error TEXT, created REAL, updated REAL, UNIQUE(source,chat,mid,part));
             CREATE TABLE IF NOT EXISTS quarantine(
                 id INTEGER PRIMARY KEY, platform TEXT NOT NULL, chat TEXT NOT NULL,
                 event_key TEXT NOT NULL, payload TEXT NOT NULL, error TEXT NOT NULL,
@@ -413,9 +427,18 @@ class Store:
                 id INTEGER PRIMARY KEY, scope TEXT NOT NULL, target_id INTEGER NOT NULL,
                 action TEXT NOT NULL, old_state TEXT NOT NULL, new_state TEXT NOT NULL,
                 reason TEXT NOT NULL, created REAL NOT NULL);
-            PRAGMA user_version=2;
-            COMMIT;
         ''')
+        try:
+            columns = {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}
+            for name in ('created', 'updated'):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} REAL')
+            self.db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            self.db.close()
+            raise
 
     def get(self, key):
         row = self.db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
@@ -444,6 +467,8 @@ class Store:
                          json.dumps(event, ensure_ascii=False), str(exc), now, now))
             if cursor is not None:
                 self.set('cursor_' + platform, cursor)
+            self.set('last_poll_success_' + platform, time.time())
+            self.set('last_poll_error_' + platform, '')
 
     def accept_one(self, platform, event, chat_id, own_id):
         message = normalize(platform, event, chat_id, own_id)
@@ -455,10 +480,11 @@ class Store:
             if inserted:
                 destination = 'max' if platform == 'tg' else 'tg'
                 for i, part in enumerate(parts):
-                    self.db.execute('''INSERT INTO jobs(source,chat,mid,destination,part,payload,parent)
-                                      VALUES(?,?,?,?,?,?,?)''',
+                    now = time.time()
+                    self.db.execute('''INSERT INTO jobs(source,chat,mid,destination,part,payload,parent,created,updated)
+                                      VALUES(?,?,?,?,?,?,?,?,?)''',
                                     (platform, message['chat'], message['mid'], destination,
-                                     i, json.dumps(part, ensure_ascii=False), message['parent']))
+                                     i, json.dumps(part, ensure_ascii=False), message['parent'], now, now))
         self.db.execute('''UPDATE quarantine SET state='resolved',updated=?
                            WHERE platform=? AND chat=? AND event_key=? AND state='open' ''',
                         (time.time(), platform, str(chat_id), event_key(platform, event)))
@@ -515,7 +541,7 @@ class Store:
                     raise BridgeError('Повтор разрешён только для failed или uncertain')
                 if old == 'uncertain' and not accept_duplicate_risk:
                     raise BridgeError('Результат отправки неизвестен; после сверки нужен --accept-duplicate-risk')
-                self.db.execute("UPDATE jobs SET state='pending',error=NULL,ready=0 WHERE id=?", (jid,))
+                self.db.execute("UPDATE jobs SET state='pending',error=NULL,ready=0,updated=? WHERE id=?", (time.time(), jid))
                 state = 'pending'
             elif action == 'confirm':
                 if (not isinstance(remote_id, str) or not remote_id or len(remote_id) > 256
@@ -524,6 +550,8 @@ class Store:
                     raise BridgeError('Укажите корректный ID опубликованной копии')
                 if job['destination'] == 'tg' and (not remote_id.isascii() or not remote_id.isdecimal() or int(remote_id) <= 0):
                     raise BridgeError('ID копии Telegram должен быть положительным целым числом')
+                if job['destination'] == 'tg':
+                    remote_id = str(int(remote_id))
                 if old == 'sent' and job['remote_id'] == remote_id:
                     return old
                 if old != 'uncertain':
@@ -532,7 +560,7 @@ class Store:
                                             (job['destination'], remote_id, jid)).fetchone()
                 if duplicate:
                     raise BridgeError('Этот ID копии уже связан с другой задачей')
-                self.db.execute("UPDATE jobs SET state='sent',remote_id=?,error=NULL,ready=0 WHERE id=?", (remote_id, jid))
+                self.db.execute("UPDATE jobs SET state='sent',remote_id=?,error=NULL,ready=0,updated=? WHERE id=?", (remote_id, time.time(), jid))
                 state = 'sent'
             elif action == 'skip':
                 if old not in ('pending', 'failed', 'uncertain', 'skipped'):
@@ -546,7 +574,7 @@ class Store:
                         raise BridgeError('Одна из частей сообщения сейчас отправляется')
                 for row in rows:
                     if row['state'] != 'skipped':
-                        self.db.execute("UPDATE jobs SET state='skipped',error=NULL,ready=0 WHERE id=?", (row['id'],))
+                        self.db.execute("UPDATE jobs SET state='skipped',error=NULL,ready=0,updated=? WHERE id=?", (time.time(), row['id']))
                         self.audit('job', row['id'], action, row['state'], 'skipped', reason)
                 return 'skipped'
             else:
@@ -570,12 +598,35 @@ class Store:
 
     def update(self, jid, state, error=None, remote_id=None, delay=0):
         with self.db:
-            self.db.execute('''UPDATE jobs SET state=?,error=?,remote_id=?,ready=?,attempts=attempts+1
-                               WHERE id=?''', (state, error, remote_id, time.time() + delay, jid))
+            now = time.time()
+            self.db.execute('''UPDATE jobs SET state=?,error=?,remote_id=?,ready=?,attempts=attempts+1,updated=?
+                               WHERE id=?''', (state, error, remote_id, now + delay, now, jid))
+            if state == 'sent':
+                row = self.db.execute('SELECT destination FROM jobs WHERE id=?', (jid,)).fetchone()
+                self.set('last_delivery_success_' + row['destination'], now)
 
     def recover(self):
         with self.db:
-            self.db.execute("UPDATE jobs SET state='uncertain',error='Процесс остановился при отправке' WHERE state='sending'")
+            self.db.execute("UPDATE jobs SET state='uncertain',error='Процесс остановился при отправке',updated=? WHERE state='sending'", (time.time(),))
+
+    def runtime(self, state):
+        with self.db:
+            now = time.time()
+            self.set('runtime_state', state)
+            self.set('heartbeat', now)
+            if state == 'running':
+                self.set('run_started', now)
+            else:
+                self.set('run_stopped', now)
+
+    def heartbeat(self):
+        with self.db:
+            self.set('heartbeat', time.time())
+
+    def poll_failure(self, platform, error):
+        with self.db:
+            self.set('last_poll_error_' + platform, str(error))
+            self.set('last_poll_failure_' + platform, time.time())
 
 
 class Bridge:
@@ -583,17 +634,21 @@ class Bridge:
         self.cfg, self.api, self.store, self.ids = cfg, api, store, ids
 
     def poll(self, platform):
-        cursor = self.store.get('cursor_' + platform)
-        if platform == 'tg':
-            events = self.api.request('tg', 'getUpdates', method='POST', body={
-                'offset': int(cursor) if cursor is not None else None,
-                'timeout': 0, 'allowed_updates': ['message']})
-            next_cursor = max(e['update_id'] for e in events) + 1 if events else cursor
-        else:
-            result = self.api.request('max', '/updates', query={
-                'marker': cursor, 'timeout': 0, 'types': 'message_created', 'limit': 100})
-            events, next_cursor = result.get('updates', []), result.get('marker')
-        self.store.accept(platform, events, next_cursor, self.cfg[platform.upper() + '_CHAT_ID'], self.ids[platform])
+        try:
+            cursor = self.store.get('cursor_' + platform)
+            if platform == 'tg':
+                events = self.api.request('tg', 'getUpdates', method='POST', body={
+                    'offset': int(cursor) if cursor is not None else None,
+                    'timeout': 0, 'allowed_updates': ['message']})
+                next_cursor = max(e['update_id'] for e in events) + 1 if events else cursor
+            else:
+                result = self.api.request('max', '/updates', query={
+                    'marker': cursor, 'timeout': 0, 'types': 'message_created', 'limit': 100})
+                events, next_cursor = result.get('updates', []), result.get('marker')
+            self.store.accept(platform, events, next_cursor, self.cfg[platform.upper() + '_CHAT_ID'], self.ids[platform])
+        except BridgeError as exc:
+            self.store.poll_failure(platform, exc)
+            raise
 
     def deliver(self, destination):
         # Keep ordering; uncertain/failed publication blocks this destination until reviewed.
@@ -746,13 +801,224 @@ def bind(state=STATE):
 
 
 @contextmanager
-def process_lock(state):
-    with (state / 'process.lock').open('a') as lock:
+def process_lock(state, name='process.lock'):
+    with (state / name).open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if name != 'process.lock':
+                raise BridgeError('Другой монитор уже использует этот каталог состояния') from None
             raise BridgeError('Другой процесс использует прототип; остановите его перед изменением очереди') from None
         yield
+
+
+def bridge_running(state):
+    try:
+        with (state / 'process.lock').open('r') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=300):
+    now = time.time() if now is None else now
+    result = {'ok': False, 'generated_at': now, 'schema_version': None,
+              'thresholds': {'stale_after_seconds': stale_after, 'queue_age_seconds': queue_age},
+              'runtime': {}, 'platforms': {}, 'issues': []}
+    issues = result['issues']
+
+    def issue(key, code, **details):
+        issues.append({'key': key, 'code': code, **details})
+
+    if store is None:
+        issue('state', 'state_missing')
+        return result
+
+    def timestamp(key):
+        try:
+            value = float(store.get(key))
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
+
+    def age(value):
+        return max(0, now - value) if value is not None else None
+
+    version = store.db.execute('PRAGMA user_version').fetchone()[0]
+    result['schema_version'] = version
+    if version < SCHEMA_VERSION:
+        issue('schema', 'migration_required')
+    heartbeat = timestamp('heartbeat')
+    started = timestamp('run_started')
+    state = store.get('runtime_state') or 'unknown'
+    result['runtime'] = {'state': state, 'process_running': running, 'heartbeat_at': heartbeat,
+                         'heartbeat_age_seconds': age(heartbeat), 'started_at': started,
+                         'stopped_at': timestamp('run_stopped')}
+    if not running or state == 'stopped':
+        issue('runtime', 'process_stopped')
+    elif heartbeat is None or age(heartbeat) > stale_after:
+        issue('runtime', 'heartbeat_stale')
+    columns = {row['name'] for row in store.db.execute('PRAGMA table_info(jobs)')}
+    for platform in ('tg', 'max'):
+        success = timestamp('last_poll_success_' + platform)
+        failure = timestamp('last_poll_failure_' + platform)
+        poll_error = bool(store.get('last_poll_error_' + platform))
+        warming_up = success is None and started is not None and age(started) <= stale_after
+        poll_state = 'error' if poll_error else 'starting' if warming_up else 'ok'
+        if poll_error:
+            issue('poll:' + platform, 'poll_error', platform=platform)
+        elif not warming_up and (success is None or age(success) > stale_after):
+            poll_state = 'stale'
+            issue('poll:' + platform, 'poll_stale', platform=platform)
+        counts = {row['state']: row['n'] for row in store.db.execute(
+            'SELECT state,count(*) AS n FROM jobs WHERE destination=? GROUP BY state', (platform,))}
+        head = store.db.execute('''SELECT id,state,ready FROM jobs WHERE destination=?
+            AND state NOT IN ('sent','skipped') ORDER BY id LIMIT 1''', (platform,)).fetchone()
+        pending_age = unresolved_age = None
+        unknown_age = 0
+        if 'created' in columns:
+            ages = store.db.execute('''SELECT
+                min(CASE WHEN state='pending' THEN created END) AS pending,
+                min(created) AS unresolved,
+                sum(CASE WHEN created IS NULL THEN 1 ELSE 0 END) AS unknown
+                FROM jobs WHERE destination=? AND state NOT IN ('sent','skipped')''', (platform,)).fetchone()
+            pending_age, unresolved_age = age(ages['pending']), age(ages['unresolved'])
+            unknown_age = ages['unknown'] or 0
+        else:
+            unknown_age = sum(n for key, n in counts.items() if key not in ('sent', 'skipped'))
+        if head and head['state'] in ('failed', 'uncertain'):
+            issue('blocked:' + platform, 'delivery_blocked', platform=platform, job_id=head['id'], state=head['state'])
+        if unresolved_age is not None and unresolved_age > queue_age:
+            issue('backlog:' + platform, 'queue_too_old', platform=platform)
+        if unknown_age:
+            issue('queue-age:' + platform, 'queue_age_unknown', platform=platform, count=unknown_age)
+        q = None
+        if store.has_table('quarantine'):
+            q = store.db.execute("SELECT count(*) AS n,min(id) AS first FROM quarantine WHERE platform=? AND state='open'", (platform,)).fetchone()
+        if q and q['n']:
+            issue('quarantine:' + platform, 'input_quarantine', platform=platform, count=q['n'], first_id=q['first'])
+        result['platforms'][platform] = {
+            'poll': {'state': poll_state, 'last_success_at': success, 'last_failure_at': failure,
+                     'success_age_seconds': age(success)},
+            'delivery': {'last_success_at': timestamp('last_delivery_success_' + platform),
+                         'counts': counts, 'head': dict(head) if head else None,
+                         'oldest_pending_age_seconds': pending_age,
+                         'oldest_unresolved_age_seconds': unresolved_age,
+                         'unknown_age_count': unknown_age},
+            'quarantine_open': q['n'] if q else 0}
+    result['ok'] = not issues
+    return result
+
+
+def read_health(state, stale_after=180, queue_age=300):
+    path = state / 'bridge.sqlite3'
+    if not path.exists():
+        return health_snapshot(None, stale_after=stale_after, queue_age=queue_age)
+    store = None
+    try:
+        store = Store(path, readonly=True)
+        store.db.execute('BEGIN')
+        return health_snapshot(store, running=bridge_running(state), stale_after=stale_after, queue_age=queue_age)
+    except (OSError, sqlite3.Error, BridgeError):
+        result = health_snapshot(None, stale_after=stale_after, queue_age=queue_age)
+        result['issues'] = [{'key': 'state', 'code': 'state_unavailable'}]
+        return result
+    finally:
+        if store is not None:
+            store.db.close()
+
+
+def print_health(snapshot):
+    print('health=' + ('ok' if snapshot['ok'] else 'unhealthy'))
+    runtime = snapshot['runtime']
+    print(f"process={runtime.get('state', 'unknown')} running={runtime.get('process_running', False)} heartbeat_age={runtime.get('heartbeat_age_seconds')}")
+    for platform, data in snapshot['platforms'].items():
+        delivery = data['delivery']
+        counts = ' '.join(f'{key}={value}' for key, value in sorted(delivery['counts'].items())) or 'empty'
+        print(f"{platform}: poll={data['poll']['state']} last_poll={data['poll']['last_success_at']} last_delivery={delivery['last_success_at']} {counts} oldest_pending_age={delivery['oldest_pending_age_seconds']} oldest_unresolved_age={delivery['oldest_unresolved_age_seconds']} quarantine={data['quarantine_open']}")
+    for issue in snapshot['issues']:
+        print('issue ' + json.dumps(issue, ensure_ascii=False, sort_keys=True))
+
+
+class AlertMonitor:
+    """Durable local alert outbox; no chat content or external messaging."""
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript('''
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS monitor_state(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY,event_id TEXT UNIQUE,
+                payload TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
+        ''')
+
+    def observe(self, snapshot):
+        current = {entry['key']: entry for entry in snapshot['issues']}
+        with self.db:
+            row = self.db.execute("SELECT value FROM monitor_state WHERE key='issues'").fetchone()
+            previous = json.loads(row[0]) if row else {}
+            if not snapshot['platforms']:
+                # An unreadable/missing state is not evidence that known faults recovered.
+                current = {**previous, **current}
+            for key in sorted(set(current) | set(previous)):
+                if current.get(key) == previous.get(key):
+                    continue
+                entry = current.get(key) or previous[key]
+                alert = {'event_id': secrets.token_hex(16), 'kind': 'problem' if key in current else 'recovery',
+                         'detected_at': snapshot['generated_at'], 'issue': entry}
+                self.db.execute('INSERT INTO alerts(event_id,payload) VALUES(?,?)',
+                                (alert['event_id'], json.dumps(alert, ensure_ascii=False, sort_keys=True)))
+            self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES('issues',?)", (json.dumps(current, sort_keys=True),))
+
+    def flush(self, sink):
+        count = 0
+        for row in self.db.execute('SELECT id,payload FROM alerts WHERE delivered=0 ORDER BY id').fetchall():
+            sink(json.loads(row['payload']))
+            with self.db:
+                self.db.execute('UPDATE alerts SET delivered=1 WHERE id=?', (row['id'],))
+            count += 1
+        return count
+
+
+def emit_alert(alert, path=None):
+    line = json.dumps(alert, ensure_ascii=False, sort_keys=True)
+    if path is None:
+        print(line, flush=True)
+    else:
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(line + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def monitor(state, args):
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with process_lock(state, 'monitor.lock'):
+        alerts = AlertMonitor(state / 'monitor.sqlite3')
+        stopping = False
+
+        def stop(_signum, _frame):
+            nonlocal stopping
+            stopping = True
+
+        previous_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            while not stopping:
+                alerts.observe(read_health(state, args.stale_after, args.queue_age))
+                alerts.flush(lambda alert: emit_alert(alert, args.alerts_file))
+                if args.once:
+                    return
+                deadline = time.monotonic() + args.interval
+                while not stopping and time.monotonic() < deadline:
+                    time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        finally:
+            alerts.db.close()
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
 
 def queue_view(store, command, action, target_id=None, limit=100):
@@ -783,7 +1049,7 @@ def queue_view(store, command, action, target_id=None, limit=100):
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status', 'queue', 'quarantine'])
+    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status', 'queue', 'quarantine', 'health', 'monitor'])
     parser.add_argument('action', nargs='?', choices=['list', 'show', 'retry', 'confirm', 'skip'])
     parser.add_argument('id', nargs='?', type=int)
     parser.add_argument('--seconds', type=int, default=90)
@@ -793,7 +1059,21 @@ def main(argv=None):
     parser.add_argument('--remote-id')
     parser.add_argument('--accept-duplicate-risk', action='store_true')
     parser.add_argument('--remaining', action='store_true')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--stale-after', type=float, default=180)
+    parser.add_argument('--queue-age', type=float, default=300)
+    parser.add_argument('--interval', type=float, default=30)
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--alerts-file', type=Path)
     args = parser.parse_args(argv)
+    if not all(math.isfinite(value) and value > 0 for value in (args.stale_after, args.queue_age, args.interval)):
+        parser.error('Интервалы должны быть конечными положительными числами')
+    if args.interval > 60:
+        parser.error('--interval должен быть не более 60 секунд')
+    if args.json and args.command not in ('status', 'health'):
+        parser.error('--json разрешён только для status/health')
+    if (args.once or args.alerts_file is not None) and args.command != 'monitor':
+        parser.error('--once/--alerts-file разрешены только для monitor')
     maintenance = args.command in ('queue', 'quarantine')
     mutating = maintenance and args.action not in ('list', 'show')
     if maintenance:
@@ -816,11 +1096,18 @@ def main(argv=None):
         parser.error('Действия и параметры очереди допустимы только для queue/quarantine')
     state = args.state_dir
     db_path = state / 'bridge.sqlite3'
-    if args.command == 'status' or (maintenance and not mutating):
+    if args.command == 'monitor':
+        monitor(state, args)
+        return
+    if args.command in ('status', 'health'):
+        snapshot = read_health(state, args.stale_after, args.queue_age)
+        if args.json:
+            print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        else:
+            print_health(snapshot)
+        return 0 if args.command == 'status' or snapshot['ok'] else 1
+    if maintenance and not mutating:
         if not db_path.exists():
-            if args.command == 'status':
-                print('Очередь ещё не создана.')
-                return
             if args.action == 'list':
                 print('[]')
                 return
@@ -828,16 +1115,7 @@ def main(argv=None):
         store = Store(db_path, readonly=True)
         try:
             store.db.execute('BEGIN')
-            if maintenance:
-                print(json.dumps(queue_view(store, args.command, args.action, args.id, args.limit), ensure_ascii=False, indent=2))
-                return
-            for row in store.db.execute('SELECT destination,state,count(*) AS n FROM jobs GROUP BY destination,state'):
-                print(f"{row['destination']} {row['state']} {row['n']}")
-            for row in store.db.execute("SELECT id,destination,state,error FROM jobs WHERE state IN ('failed','uncertain','sending') ORDER BY id"):
-                print(f"job={row['id']} {row['destination']} {row['state']} {row['error'] or ''}")
-            if store.has_table('quarantine'):
-                for row in store.db.execute("SELECT id,platform,error FROM quarantine WHERE state='open' ORDER BY id"):
-                    print(f"quarantine={row['id']} {row['platform']} {row['error']}")
+            print(json.dumps(queue_view(store, args.command, args.action, args.id, args.limit), ensure_ascii=False, indent=2))
         finally:
             store.db.close()
         return
@@ -873,44 +1151,53 @@ def main(argv=None):
         ids = doctor(cfg, api, chats=bool(cfg.get('TG_CHAT_ID') and cfg.get('MAX_CHAT_ID')))
         if args.command == 'doctor':
             return
-        store = Store(db_path)
-        identity = json.dumps([ids['tg'], ids['max'], cfg['TG_CHAT_ID'], cfg['MAX_CHAT_ID']])
-        if store.get('identity') not in (None, identity):
-            raise BridgeError('База принадлежит другой паре ботов/чатов; используйте отдельное тестовое окружение')
-        with store.db:
-            store.set('identity', identity)
-        store.recover()
-        bridge = Bridge(cfg, api, store, ids)
-        stopping = False
+        with Store(db_path) as store:
+            identity = json.dumps([ids['tg'], ids['max'], cfg['TG_CHAT_ID'], cfg['MAX_CHAT_ID']])
+            if store.get('identity') not in (None, identity):
+                raise BridgeError('База принадлежит другой паре ботов/чатов; используйте отдельное тестовое окружение')
+            with store.db:
+                store.set('identity', identity)
+            store.recover()
+            bridge = Bridge(cfg, api, store, ids)
+            stopping = False
 
-        def stop(_signum, _frame):
-            nonlocal stopping
-            stopping = True
+            def stop(_signum, _frame):
+                nonlocal stopping
+                stopping = True
 
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
-        print('Тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
-        errors = {'tg': 0, 'max': 0}
-        while not stopping:
-            for platform in ('tg', 'max'):
-                try:
-                    bridge.poll(platform)
-                    errors[platform] = 0
-                except BridgeError as exc:
-                    errors[platform] += 1
-                    if errors[platform] == 1 or errors[platform] % 30 == 0:
-                        print(f'poll {platform}: {exc}', flush=True)
-                    if isinstance(exc, ApiError) and exc.code in ('401', '403', '409'):
-                        raise BridgeError(f'{platform}: остановка из-за авторизации, прав или другого poller') from None
-                bridge.deliver(platform)
-            time.sleep(1)
-        print('Остановлено. Очередь сохранена.', flush=True)
+            signal.signal(signal.SIGTERM, stop)
+            signal.signal(signal.SIGINT, stop)
+            print('Тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
+            errors = {'tg': 0, 'max': 0}
+            store.runtime('running')
+            try:
+                while not stopping:
+                    for platform in ('tg', 'max'):
+                        store.heartbeat()
+                        try:
+                            bridge.poll(platform)
+                            errors[platform] = 0
+                        except BridgeError as exc:
+                            errors[platform] += 1
+                            if errors[platform] == 1 or errors[platform] % 30 == 0:
+                                print(f'poll {platform}: {exc}', flush=True)
+                            if isinstance(exc, ApiError) and exc.code in ('401', '403', '409'):
+                                raise BridgeError(f'{platform}: остановка из-за авторизации, прав или другого poller') from None
+                        bridge.deliver(platform)
+                        store.heartbeat()
+                    time.sleep(1)
+            finally:
+                store.runtime('stopped')
+            print('Остановлено. Очередь сохранена.', flush=True)
 
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main() or 0)
     except (BridgeError, FileNotFoundError) as exc:
         # FileNotFoundError prints only the missing local path, never response/request URLs.
         print(str(exc), file=sys.stderr)
+        sys.exit(1)
+    except (OSError, sqlite3.Error):
+        print('Ошибка локального хранилища или вывода; проверьте доступ и свободное место', file=sys.stderr)
         sys.exit(1)
