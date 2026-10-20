@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import mimetypes
 import os
@@ -40,6 +41,62 @@ class ApiError(BridgeError):
 
 class TransportError(BridgeError):
     pass
+
+
+class EventError(BridgeError):
+    """An expected input validation error, safe to retain without the payload."""
+
+
+def event_object(value):
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise EventError('Ожидался объект в событии')
+    return value
+
+
+def event_text(value):
+    if value is None:
+        return ''
+    if not isinstance(value, str):
+        raise EventError('Ожидалась строка в событии')
+    return value
+
+
+def event_list(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise EventError('Ожидался список в событии')
+    return value
+
+
+def selected_message(platform, event, chat_id):
+    # An envelope with no identifiable chat cannot safely be archived or acknowledged.
+    if not isinstance(event, dict):
+        raise TransportError('Невозможно определить чат входящего события')
+    if platform == 'max' and event.get('update_type') != 'message_created':
+        return None
+    msg = event.get('message')
+    if msg is None:
+        return None
+    chat_field, id_field = ('chat', 'id') if platform == 'tg' else ('recipient', 'chat_id')
+    if (not isinstance(msg, dict) or not isinstance(msg.get(chat_field), dict)
+            or msg[chat_field].get(id_field) is None):
+        raise TransportError('Невозможно определить чат входящего события')
+    return msg if str(msg[chat_field][id_field]) == str(chat_id) else None
+
+
+def event_key(platform, event):
+    if platform == 'tg':
+        key = event.get('update_id')
+    else:
+        body = event['message'].get('body')
+        key = body.get('mid') if isinstance(body, dict) else None
+    if isinstance(key, (str, int)) and not isinstance(key, bool) and str(key):
+        return 'id:' + str(key)
+    raw = json.dumps(event, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+    return 'sha256:' + hashlib.sha256(raw.encode()).hexdigest()
 
 
 def config(require_chats=False):
@@ -233,44 +290,60 @@ def split_text(text, limit=3500):
 
 
 def normalize(platform, event, chat_id, own_id):
+    msg = selected_message(platform, event, chat_id)
+    if msg is None:
+        return None
     if platform == 'tg':
-        msg = event.get('message')
-        if not msg or str(msg.get('chat', {}).get('id')) != str(chat_id):
-            return None
-        sender = msg.get('from', {})
+        sender = event_object(msg.get('from'))
         if str(sender.get('id')) == str(own_id):
             return None
-        author = msg.get('sender_chat') or sender
-        name = author.get('title') or ' '.join(filter(None, [author.get('first_name'), author.get('last_name')])) or 'Участник'
-        text = msg.get('text') or msg.get('caption') or ''
-        photos = msg.get('photo') or []
+        author = event_object(msg.get('sender_chat')) or sender
+        name = event_text(author.get('title')) or ' '.join(filter(None, [
+            event_text(author.get('first_name')), event_text(author.get('last_name'))])) or 'Участник'
+        text = event_text(msg.get('text')) or event_text(msg.get('caption'))
+        photos = event_list(msg.get('photo'))
+        for photo in photos:
+            photo = event_object(photo)
+            if not event_text(photo.get('file_id')):
+                raise EventError('В событии Telegram отсутствует ID картинки')
+            for key in ('file_size', 'width'):
+                value = photo.get(key, 0)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise EventError('Неверный размер картинки Telegram')
         images = [max(photos, key=lambda p: (p.get('file_size', 0), p.get('width', 0)))['file_id']] if photos else []
-        reply = msg.get('reply_to_message') or {}
-        parent, quote = reply.get('message_id'), reply.get('text') or reply.get('caption') or ''
+        reply = event_object(msg.get('reply_to_message'))
+        parent = reply.get('message_id')
+        quote = event_text(reply.get('text')) or event_text(reply.get('caption'))
         unsupported = any(k in msg for k in ('video', 'document', 'voice', 'audio', 'sticker', 'animation', 'poll', 'contact', 'location', 'video_note'))
-        mid = msg['message_id']
+        mid = msg.get('message_id')
     else:
-        if event.get('update_type') != 'message_created':
-            return None
-        msg = event.get('message') or {}
-        if str(msg.get('recipient', {}).get('chat_id')) != str(chat_id):
-            return None
-        sender = msg.get('sender') or {}
+        sender = event_object(msg.get('sender'))
         if str(sender.get('user_id')) == str(own_id):
             return None
-        name = ' '.join(filter(None, [sender.get('first_name'), sender.get('last_name')])) or sender.get('name') or 'Участник'
-        body = msg.get('body') or {}
-        mid, text = body.get('mid'), body.get('text') or ''
-        attachments = body.get('attachments') or []
-        images = [a.get('payload', {}).get('url') for a in attachments if a.get('type') == 'image']
-        if any(not image for image in images):
-            raise BridgeError('В событии MAX отсутствует URL картинки')
-        unsupported = any(a.get('type') != 'image' for a in attachments)
-        link = msg.get('link') or {}
-        reply = link.get('message') or {} if link.get('type') == 'reply' else {}
-        parent, quote = reply.get('mid'), reply.get('text') or ''
-    if mid is None or not (text or images or unsupported):
+        name = ' '.join(filter(None, [event_text(sender.get('first_name')),
+                                     event_text(sender.get('last_name'))])) or event_text(sender.get('name')) or 'Участник'
+        body = event_object(msg.get('body'))
+        mid, text = body.get('mid'), event_text(body.get('text'))
+        attachments = event_list(body.get('attachments'))
+        images, unsupported = [], False
+        for attachment in attachments:
+            attachment = event_object(attachment)
+            if attachment.get('type') == 'image':
+                reference = event_text(event_object(attachment.get('payload')).get('url'))
+                if not reference:
+                    raise EventError('В событии MAX отсутствует URL картинки')
+                images.append(reference)
+            else:
+                unsupported = True
+        link = event_object(msg.get('link'))
+        reply = event_object(link.get('message')) if link.get('type') == 'reply' else {}
+        parent, quote = reply.get('mid'), event_text(reply.get('text'))
+    if not (text or images or unsupported):
         return None
+    if not isinstance(mid, (str, int)) or isinstance(mid, bool) or not str(mid):
+        raise EventError('В событии отсутствует корректный ID сообщения')
+    if parent is not None and (not isinstance(parent, (str, int)) or isinstance(parent, bool)):
+        raise EventError('Неверный ID исходного сообщения ответа')
     # No rich HTML/Markdown: sender names and message text remain plain text.
     name = ' '.join(name.split())[:100]
     return {'platform': platform, 'chat': str(chat_id), 'mid': str(mid), 'name': name,
@@ -302,8 +375,22 @@ class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        version = self.db.execute('PRAGMA user_version').fetchone()[0]
+        if version > 1:
+            self.db.close()
+            raise BridgeError('База создана более новой версией программы')
+        existing = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='jobs'").fetchone()
+        if existing and version == 0 and str(path) != ':memory:':
+            backup_path = Path(str(path) + '.v0-' + secrets.token_hex(6) + '.bak')
+            backup = sqlite3.connect(backup_path)
+            try:
+                self.db.backup(backup)
+            finally:
+                backup.close()
+            backup_path.chmod(0o600)
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
+            BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS inbox(
                 platform TEXT, chat TEXT, mid TEXT, PRIMARY KEY(platform,chat,mid));
@@ -312,6 +399,14 @@ class Store:
                 part INTEGER, payload TEXT, parent TEXT, state TEXT DEFAULT 'pending',
                 remote_id TEXT, attempts INTEGER DEFAULT 0, ready REAL DEFAULT 0,
                 error TEXT, UNIQUE(source,chat,mid,part));
+            CREATE TABLE IF NOT EXISTS quarantine(
+                id INTEGER PRIMARY KEY, platform TEXT NOT NULL, chat TEXT NOT NULL,
+                event_key TEXT NOT NULL, payload TEXT NOT NULL, error TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'open', attempts INTEGER NOT NULL DEFAULT 0,
+                created REAL NOT NULL, updated REAL NOT NULL,
+                UNIQUE(platform,chat,event_key));
+            PRAGMA user_version=1;
+            COMMIT;
         ''')
 
     def get(self, key):
@@ -322,24 +417,58 @@ class Store:
         self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key, str(value)))
 
     def accept(self, platform, events, cursor, chat_id, own_id):
-        # The cursor and jobs commit together; a crash cannot acknowledge an unrecorded message.
+        # Cursor, valid jobs and quarantined inputs commit together. DB/programming
+        # failures still roll back the whole batch; only expected input errors are isolated.
         with self.db:
             for event in events:
-                message = normalize(platform, event, chat_id, own_id)
-                if message is None:
+                if selected_message(platform, event, chat_id) is None:
                     continue
-                inserted = self.db.execute('INSERT OR IGNORE INTO inbox VALUES(?,?,?)',
-                                           (platform, message['chat'], message['mid'])).rowcount
-                if not inserted:
-                    continue
-                destination = 'max' if platform == 'tg' else 'tg'
-                for i, part in enumerate(units(message)):
-                    self.db.execute('''INSERT INTO jobs(source,chat,mid,destination,part,payload,parent)
-                                       VALUES(?,?,?,?,?,?,?)''',
-                                    (platform, message['chat'], message['mid'], destination,
-                                     i, json.dumps(part, ensure_ascii=False), message['parent']))
+                try:
+                    self.accept_one(platform, event, chat_id, own_id)
+                except EventError as exc:
+                    now = time.time()
+                    self.db.execute('''INSERT OR IGNORE INTO quarantine
+                        (platform,chat,event_key,payload,error,created,updated) VALUES(?,?,?,?,?,?,?)''',
+                        (platform, str(chat_id), event_key(platform, event),
+                         json.dumps(event, ensure_ascii=False), str(exc), now, now))
             if cursor is not None:
                 self.set('cursor_' + platform, cursor)
+
+    def accept_one(self, platform, event, chat_id, own_id):
+        message = normalize(platform, event, chat_id, own_id)
+        if message is not None:
+            # Build all parts before inserting, so validation never leaves a partial message.
+            parts = units(message)
+            inserted = self.db.execute('INSERT OR IGNORE INTO inbox VALUES(?,?,?)',
+                                      (platform, message['chat'], message['mid'])).rowcount
+            if inserted:
+                destination = 'max' if platform == 'tg' else 'tg'
+                for i, part in enumerate(parts):
+                    self.db.execute('''INSERT INTO jobs(source,chat,mid,destination,part,payload,parent)
+                                      VALUES(?,?,?,?,?,?,?)''',
+                                    (platform, message['chat'], message['mid'], destination,
+                                     i, json.dumps(part, ensure_ascii=False), message['parent']))
+        self.db.execute('''UPDATE quarantine SET state='resolved',updated=?
+                           WHERE platform=? AND chat=? AND event_key=? AND state='open' ''',
+                        (time.time(), platform, str(chat_id), event_key(platform, event)))
+
+    def retry_quarantine(self, qid, chat_id, own_id):
+        with self.db:
+            row = self.db.execute('SELECT * FROM quarantine WHERE id=?', (qid,)).fetchone()
+            if row is None:
+                raise BridgeError('Событие карантина не найдено')
+            if row['chat'] != str(chat_id):
+                raise BridgeError('Событие принадлежит другому чату')
+            if row['state'] != 'open':
+                return row['state']
+            event = json.loads(row['payload'])
+            try:
+                self.accept_one(row['platform'], event, chat_id, own_id)
+            except EventError as exc:
+                self.db.execute('UPDATE quarantine SET error=?,updated=? WHERE id=?',
+                                (str(exc), time.time(), qid))
+            self.db.execute('UPDATE quarantine SET attempts=attempts+1 WHERE id=?', (qid,))
+        return self.db.execute('SELECT state FROM quarantine WHERE id=?', (qid,)).fetchone()[0]
 
     def parent_id(self, job):
         if not job['parent']:
@@ -548,6 +677,8 @@ def main():
             print(f"{row['destination']} {row['state']} {row['n']}")
         for row in store.db.execute("SELECT id,destination,state,error FROM jobs WHERE state IN ('failed','uncertain','sending') ORDER BY id"):
             print(f"job={row['id']} {row['destination']} {row['state']} {row['error'] or ''}")
+        for row in store.db.execute("SELECT id,platform,error FROM quarantine WHERE state='open' ORDER BY id"):
+            print(f"quarantine={row['id']} {row['platform']} {row['error']}")
         return
     # Discovery and run are exclusive; prevents two processes consuming the same streams.
     with (STATE / 'process.lock').open('a') as lock:

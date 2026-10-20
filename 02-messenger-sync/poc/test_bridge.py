@@ -1,9 +1,10 @@
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location('bridge', Path(__file__).with_name('bridge.py'))
 b = importlib.util.module_from_spec(spec)
@@ -134,13 +135,68 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(''.join(parts), text)
         self.assertTrue(all(len(p.encode('utf-16-le')) // 2 <= 3500 for p in parts))
 
-    def test_cursor_and_jobs_are_atomic_on_bad_image(self):
+    def test_bad_image_is_quarantined_without_blocking_good_events(self):
         event = mx()
         event['message']['body']['attachments'] = [{'type': 'image', 'payload': {}}]
-        with self.assertRaises(b.BridgeError):
-            self.store.accept('max', [mx('first'), event], 3, '-200', '88')
+        for _ in range(2):
+            self.store.accept('max', [mx('first'), event, mx('last')], 3, '-200', '88')
+        self.assertEqual([job['mid'] for job in self.jobs()], ['first', 'last'])
+        self.assertEqual(self.store.get('cursor_max'), '3')
+        rows = self.store.db.execute('SELECT * FROM quarantine').fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(json.loads(rows[0]['payload']), event)
+        self.assertEqual(rows[0]['state'], 'open')
+
+    def test_malformed_selected_fields_are_isolated_but_foreign_chat_is_ignored(self):
+        bad = [mx('bad-text', text=[]), mx('bad-body'), mx('bad-attachment')]
+        bad[1]['message']['body'] = ['invalid']
+        bad[2]['message']['body']['attachments'] = ['invalid']
+        foreign = mx('foreign', chat=-999)
+        foreign['message']['body'] = ['private']
+        self.store.accept('max', [*bad, foreign, mx('good')], 4, '-200', '88')
+        self.assertEqual(len(self.jobs()), 1)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 3)
+
+    def test_database_error_rolls_back_jobs_quarantine_and_cursor(self):
+        event = mx('bad', text=[])
+        self.store.db.execute("""CREATE TRIGGER fail_cursor BEFORE INSERT ON meta
+                               BEGIN SELECT RAISE(ABORT, 'injected'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.accept('max', [mx('good'), event], 3, '-200', '88')
         self.assertEqual(len(self.jobs()), 0)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 0)
         self.assertIsNone(self.store.get('cursor_max'))
+
+    def test_programming_error_is_not_silently_quarantined(self):
+        with patch.object(b, 'normalize', side_effect=RuntimeError('bug')):
+            with self.assertRaises(RuntimeError):
+                self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.assertIsNone(self.store.get('cursor_tg'))
+
+    def test_quarantine_survives_restart_and_can_be_reprocessed_once(self):
+        event = mx('bad', text=[])
+        self.store.accept('max', [event], 3, '-200', '88')
+        self.store.db.close()
+        self.store = b.Store(Path(self.tmp.name) / 'state.db')
+        self.assertEqual(self.store.retry_quarantine(1, '-200', '88'), 'open')
+        repaired = b.normalize('max', mx('bad'), '-200', '88')
+        with patch.object(b, 'normalize', return_value=repaired):
+            self.assertEqual(self.store.retry_quarantine(1, '-200', '88'), 'resolved')
+            self.store.retry_quarantine(1, '-200', '88')
+        self.assertEqual(len(self.jobs()), 1)
+        self.assertEqual(self.store.get('cursor_max'), '3')
+
+    def test_legacy_database_is_backed_up_and_migrated_without_losing_jobs(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        self.store.update(1, 'sent', remote_id='old-copy')
+        self.store.db.execute('DROP TABLE quarantine')
+        self.store.db.execute('PRAGMA user_version=0')
+        self.store.db.close()
+        self.store = b.Store(Path(self.tmp.name) / 'state.db')
+        self.assertEqual(self.jobs()[0]['remote_id'], 'old-copy')
+        self.assertEqual(self.store.get('cursor_tg'), '2')
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 1)
+        self.assertEqual(len(list(Path(self.tmp.name).glob('state.db.v0-*.bak'))), 1)
 
     def test_unknown_media_hosts_rejected(self):
         for url in ('http://i.oneme.ru/a', 'https://localhost/a', 'https://oneme.ru.evil.test/a',
