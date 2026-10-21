@@ -1,19 +1,19 @@
 # Разбор очереди Telegram ↔ MAX
 
-Мост обеспечивает общение между группами по [основному описанию сервиса](../SERVICE-DESCRIPTION.md), включая ответы администратора из Telegram на вопросы из MAX. Эта инструкция описывает действия оператора при сбоях доставки и проверке состояния сервиса.
+Описание сервиса приведено в [README](../../README.md). Эта инструкция описывает действия оператора при сбоях доставки и проверке состояния.
 
-Команды выполняются из корня проекта после `rtk proxy uv sync --locked`. Просмотр работает без токенов и сетевых запросов. По умолчанию используется `.state/bridge.sqlite3`; `--state-dir /абсолютный/путь` выбирает отдельный каталог состояния, например для локальных испытаний.
+Команды выполняются из корня проекта после `uv sync --locked`. Просмотр работает без токенов и сетевых запросов. По умолчанию используется `02-messenger-sync/.state/bridge.sqlite3`; `--state-dir /абсолютный/путь` выбирает отдельный каталог состояния, например для локальных испытаний.
 
-Актуализация 20.10.2026: async-мост `96a928f` и монитор запущены как локальные фоновые процессы, пользователь подтвердил ручной тест. Дополнительная проверка дала 44 доставки; на итоговом снимке `health: ok`, незавершённых задач и открытого карантина нет. Тест остановлен по просьбе пользователя; мост оставлен работающим. [Протокол](LIVE-ASYNC-TEST-2026-10-20.md). В этом окружении PID сохранены в `.state/live-bridge.pid` и `.state/live-monitor.pid`, вывод — в одноимённых `.log`; интервал монитора — 5 секунд. Для остановки фонового процесса отправить SIGTERM его проверенному текущему PID. Наличие PID-файла само по себе не подтверждает, что процесс ещё работает; использовать `health` и блокировки. При клонировании эти локальные файлы отсутствуют.
+Локальный тест 20.10.2026 завершился с `health: ok` и пустой очередью. Этот снимок не показывает текущее состояние после клонирования или переноса. Для работающего процесса проверять `health`, а при запуске службой — также её состояние в системе управления службами.
 
 ## Просмотр
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue list --limit 100
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue show 12
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine list
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine show 3
+.venv/bin/python 02-messenger-sync/poc/bridge.py status
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue list --limit 100
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue show 12
+.venv/bin/python 02-messenger-sync/poc/bridge.py quarantine list
+.venv/bin/python 02-messenger-sync/poc/bridge.py quarantine show 3
 ```
 
 Команды `list` показывают первые записи по ID в пределах лимита; `show` — метаданные выбранной записи. Текст сообщения, исходное событие, приватные URL и причины ручных действий из аудита в обычный вывод не включаются. `queue show` показывает связанные части и историю состояний. Просмотр можно выполнять при работающем мосте; он не мигрирует базу.
@@ -29,7 +29,7 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine show 3
 Устранить причину отказа, затем вернуть задачу в ожидание:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --reason 'Причина отказа устранена'
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --reason 'Причина отказа устранена'
 ```
 
 Команда не отправляет сообщение сама. Отправка выполняется после следующего `run`. Повтор команды для уже ожидающей задачи ничего не меняет.
@@ -39,7 +39,7 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --reas
 Сверить целевую группу с исходным сообщением. Если копия найдена, записать её ID:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue confirm 12 --remote-id mid.example --reason 'Копия найдена в целевой группе'
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue confirm 12 --remote-id mid.example --reason 'Копия найдена в целевой группе'
 ```
 
 Для копии в Telegram нужен положительный числовой ID. Подтверждение восстанавливает связь для ответов. Повтор подтверждения с тем же ID безопасен; другой ID для уже доставленной задачи отклоняется. ID, занятый другой задачей того же направления, также отклоняется.
@@ -47,7 +47,7 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue confirm 12 --re
 Если принято решение повторить неопределённую отправку:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --accept-duplicate-risk --reason 'После сверки принято решение о повторе'
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --accept-duplicate-risk --reason 'После сверки принято решение о повторе'
 ```
 
 Повтор может создать дубль, если первая публикация всё-таки состоялась. Флаг фиксирует осознанное решение; программа не утверждает, что копии нет.
@@ -57,8 +57,8 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue retry 12 --acce
 Пропустить одну задачу либо все ещё неотправленные части того же сообщения начиная с неё:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --reason 'Доставка отменена ответственным'
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --remaining --reason 'Оставшиеся части сообщения отменены'
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --reason 'Доставка отменена ответственным'
+.venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --remaining --reason 'Оставшиеся части сообщения отменены'
 ```
 
 `skipped` не блокирует следующие сообщения. Уже отправленные части сохраняются, части других сообщений не затрагиваются. Пропуск одного фрагмента без `--remaining` оставляет остальные фрагменты в очереди.
@@ -68,7 +68,7 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py queue skip 12 --remai
 После исправления обработчика повторно разобрать сохранённое событие:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine retry 3 --reason 'Обработчик исправлен и проверен'
+.venv/bin/python 02-messenger-sync/poc/bridge.py quarantine retry 3 --reason 'Обработчик исправлен и проверен'
 ```
 
 Команда использует сохранённую привязку ботов и чатов. Если ошибка остаётся, событие сохраняет состояние `open`, причина и счётчик попыток обновляются. При успехе оно становится `resolved`, задачи появляются в очереди без перемещения курсора. Повтор для `resolved` ничего не добавляет. Восстановленное сообщение может быть доставлено после более новых.
@@ -76,8 +76,8 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py quarantine retry 3 --
 ## Возобновление
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py run
+.venv/bin/python 02-messenger-sync/poc/bridge.py status
+.venv/bin/python 02-messenger-sync/poc/bridge.py run
 ```
 
 Перед миграцией создаётся резервная копия предыдущей схемы рядом с базой с правами 0600. Не заменять рабочую базу старой копией при запущенном процессе: откат состояния может привести к повтору уже опубликованных сообщений.
@@ -85,8 +85,8 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py run
 ## Мониторинг
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py status --json
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py health --json
+.venv/bin/python 02-messenger-sync/poc/bridge.py status --json
+.venv/bin/python 02-messenger-sync/poc/bridge.py health --json
 ```
 
 `status` возвращает код 0, если удалось сформировать вывод; смотреть поле `ok`. `health` возвращает код 0 при `ok=true`, 1 при проблеме. Ошибка аргументов CLI даёт код 2. Эти команды читают локальное состояние и не обращаются к API. При отсутствии или недоступности базы `health` возвращает JSON с причиной `state_missing` или `state_unavailable`.
@@ -96,13 +96,13 @@ rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py health --json
 Для непрерывного наблюдения запустить **отдельный процесс**, пока мост работает в другом терминале:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py monitor --interval 30 --stale-after 180 --queue-age 300 --alerts-file 02-messenger-sync/.state/alerts.jsonl
+.venv/bin/python 02-messenger-sync/poc/bridge.py monitor --interval 30 --stale-after 180 --queue-age 300 --alerts-file 02-messenger-sync/.state/alerts.jsonl
 ```
 
 Один проход для внешнего планировщика:
 
 ```sh
-rtk proxy .venv/bin/python 02-messenger-sync/poc/bridge.py monitor --once
+.venv/bin/python 02-messenger-sync/poc/bridge.py monitor --once
 ```
 
 Без `--alerts-file` события пишутся в stdout, по одному JSON-объекту на строку. При неизменном состоянии вывода нет. Все запуски одного монитора должны использовать один и тот же каталог состояния и один выбранный канал вывода: отметка о выдаче относится к событию, а не к каждому возможному файлу/получателю. Уже выданные события не переигрываются при смене канала.
