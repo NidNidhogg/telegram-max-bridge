@@ -375,5 +375,180 @@ def step_d2_wait_check(ready):
     print(f'D2 recreate OK: retry time kept across recreation, retried after {gap:.1f}s with reply link; '
           'confirmed sends not repeated')
 
+
+# --- D3: crash points, deduplication, echo and owner lock ----------------------------------
+
+def long_text(marker, tail=''):
+    return marker + ' ' + 'слово ' * 700 + tail  # > 3500 chars: two parts
+
+
+def parts(source, mid):
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute('SELECT * FROM jobs WHERE source=? AND mid=? ORDER BY part',
+                                              (source, str(mid)))]
+
+
+def quarantined():
+    with db() as conn:
+        return conn.execute('SELECT count(*) FROM quarantine').fetchone()[0]
+
+
+def total_pubs():
+    return len(mock_state()['publications'])
+
+
+def step_d3_accept_start():
+    bad = {'update_id': 703, 'message': {'message_id': 703, 'chat': {'id': -100}, 'from': {'id': 10},
+                                         'photo': [{'file_size': 1}]}}
+    print(meta('cursor_tg'), quarantined(), total_pubs())
+    call('inject_many', platform='tg', events=[tg_event(701, 'd3-a1'), tg_event(702, long_text('d3-a2')),
+                                               bad, tg_event(704, 'd3-a4 d3-freeze-accept')])
+
+
+def step_d3_accept_frozen(cursor, quarantine, total):
+    assert str(meta('cursor_tg')) == cursor, (meta('cursor_tg'), cursor)
+    assert not any(parts('tg', m) for m in (701, 702, 704)) and quarantined() == int(quarantine)
+    assert total_pubs() == int(total)
+    print('D3 accept frozen: batch inside the open transaction; cursor, jobs and quarantine not committed')
+
+
+def step_d3_accept_check(cursor, quarantine, total):
+    until(lambda: all(pubs(m) for m in ('d3-a1', 'd3-a2', 'd3-a4')), 'redelivered batch')
+    long = parts('tg', 702)
+    until(lambda: all(p['state'] == 'sent' for p in parts('tg', 702)), 'all parts of the long message')
+    time.sleep(3)
+    assert len(long) == 2 and all(len(pubs(m)) == 1 for m in ('d3-a1', 'd3-a2', 'd3-a4'))
+    assert total_pubs() == int(total) + 4, (total_pubs(), total)
+    assert quarantined() == int(quarantine) + 1 and meta('cursor_tg') == '705', (quarantined(), meta('cursor_tg'))
+    order('d3-a1', 'd3-a2', 'd3-a4')
+    print(f'D3 accept OK: after SIGKILL inside the accept transaction (cursor {cursor}) the redelivered '
+          'batch gave 3 messages (one in 2 parts) once, in order, and 1 quarantine entry')
+
+
+def step_d3_echo():
+    own_tg = tg_event(705, 'd3-echo-tg')
+    own_tg['message']['from'] = {'id': 9001, 'is_bot': True, 'first_name': 'stand'}
+    own_max = max_event('d3echo', 'd3-echo-max')
+    own_max['message']['sender'] = {'user_id': 9002, 'is_bot': True, 'name': 'stand'}
+    other = tg_event(706, 'd3-otherbot')
+    other['message']['from'] = {'id': 555, 'is_bot': True, 'first_name': 'Other'}
+    for event in (own_tg, other, tg_event(707, 'd3-same'), tg_event(708, 'd3-same')):
+        inject('tg', event)
+    inject('max', own_max)
+    until(lambda: pubs('d3-otherbot') and len(pubs('d3-same')) == 2, 'other bot and identical texts')
+    time.sleep(3)
+    assert not pubs('d3-echo-tg') and not pubs('d3-echo-max')
+    assert not parts('tg', 705) and not parts('max', 'd3echo') and len(pubs('d3-same')) == 2
+    print('D3 echo OK: own-bot echoes ignored both ways; another bot and two identical human texts delivered')
+
+
+def step_d3_photo_start():
+    call('hold', name='tg_file')
+    call('hold', name='max_media')
+    inject('tg', tg_event(711, 'd3-p1', reply_to=pub('stand-m1')['remote_id'], photo=True))
+    inject('tg', tg_event(712, 'd3-p2'))
+    inject('max', max_event('d3pm1', 'd3-pm1', reply_to=pub('stand-t1')['remote_id'], photo=True))
+    inject('max', max_event('d3pm2', 'd3-pm2'))
+    until(lambda: mock_state()['entered'].get('tg_file') and mock_state()['entered'].get('max_media')
+          and parts('tg', 712) and parts('max', 'd3pm2'), 'photo downloads held in both directions')
+    keys = (('tg', 711), ('tg', 712), ('max', 'd3pm1'), ('max', 'd3pm2'))
+    assert [parts(s, m)[0]['state'] for s, m in keys] == ['pending'] * 4
+    assert not any(pubs(m) for m in ('d3-p1', 'd3-p2', 'd3-pm1', 'd3-pm2'))
+    print('D3 photo: both photo downloads in progress, photos and texts behind them pending')
+
+
+def step_d3_photo_release():
+    call('release', name='tg_file')
+    call('release', name='max_media')
+
+
+def step_d3_photo_check():
+    until(lambda: all(pubs(m) for m in ('d3-p1', 'd3-p2', 'd3-pm1', 'd3-pm2')), 'photos after recreation')
+    time.sleep(2)
+    assert all(len(pubs(m)) == 1 for m in ('d3-p1', 'd3-p2', 'd3-pm1', 'd3-pm2'))
+    assert pub('d3-p1')['kind'] == 'photo' and pub('d3-p1')['reply'] == 'm1', pub('d3-p1')
+    assert pub('d3-pm1')['kind'] == 'photo' and pub('d3-pm1')['reply'] == 1, pub('d3-pm1')
+    order('d3-p1', 'd3-p2')
+    order('d3-pm1', 'd3-pm2')
+    print('D3 photo OK: SIGKILL during photo preparation both ways; photo+caption+reply and the text '
+          'behind it delivered once, in order')
+
+
+def step_d3_inject(platform, mid, text, tail=''):
+    if text == 'long':
+        text = long_text(mid, tail)
+    reply = pub('stand-m1')['remote_id'] if platform == 'tg' else None
+    inject(platform, tg_event(int(mid[2:]), text, reply_to=reply) if platform == 'tg' else max_event(mid, text))
+
+
+def check_parts(source, mid, states, marker, count):
+    current = parts(source, mid)
+    assert [p['state'] for p in current] == states.split(','), (mid, current)
+    assert len(pubs(marker)) == int(count), (marker, pubs(marker))
+    remote = {str(p['remote_id']) for p in mock_state()['publications']}
+    assert all(str(p['remote_id']) in remote for p in current if p['state'] == 'sent'), current
+    assert len({p['remote_id'] for p in current if p['remote_id']}) == len([p for p in current if p['remote_id']])
+    return current
+
+
+def step_d3_frozen(source, mid, states, marker, count):
+    check_parts(source, mid, states, marker, count)
+    print(f'D3 crash point: {source} {mid} parts {states}, {count} publication(s) of {marker}')
+
+
+def step_d3_kept(source, mid, states, marker, count, replay=''):
+    until(lambda: [p['state'] for p in parts(source, mid)] == states.split(','), f'{mid} -> {states}')
+    if replay:
+        polls = mock_state()['polls'][replay]
+        call('replay', platform=replay)
+        until(lambda: mock_state()['polls'][replay] >= polls + 3, 'replayed polls')
+    time.sleep(4)
+    current = check_parts(source, mid, states, marker, count)
+    assert (STATE / 'process.lock').exists()
+    print(f'D3 recovery OK: {source} {mid} parts {states}, still {count} publication(s) of {marker}'
+          + (f', {replay} event redelivered without new jobs' if replay else ''), file=sys.stderr)
+    print(current[-1]['id'], (pubs(marker) or [{'remote_id': '-'}])[0]['remote_id'])
+
+
+def step_d3_sent_reply():
+    inject('max', max_event('d3c2', 'd3-c2', reply_to=pub('tg741')['remote_id']))
+    until(lambda: pubs('d3-c2'), 'reply to the copy sent before the crash')
+    assert pub('d3-c2')['reply'] == 741 and pub('tg741')['reply'] == 'm1', (pub('d3-c2'), pub('tg741'))
+    print('D3 sent OK: remote ID and reply links kept after SIGKILL right after the sent COMMIT')
+
+
+def step_d3_other_direction():
+    inject('max', max_event('d3x1', 'd3-x1'))
+    until(lambda: pubs('d3-x1'), 'opposite direction while a part is uncertain')
+    print('D3 multipart OK: the uncertain part blocks only its direction')
+
+
+def step_d3_hash():
+    import hashlib
+    names = sorted(p.name for p in STATE.iterdir() if p.name.startswith('bridge.sqlite3') and '.bak' not in p.name)
+    print(' '.join(f'{n}:{hashlib.sha256((STATE / n).read_bytes()).hexdigest()[:16]}' for n in names))
+
+
+def step_d3_confirm_reply():
+    assert row('max', 'd3u1')['state'] == 'sent' and len(pubs('maxd3u1')) == 1
+    inject('tg', tg_event(791, 'd3-r1', reply_to=pub('maxd3u1')['remote_id']))
+    until(lambda: pubs('d3-r1'), 'reply to the confirmed copy')
+    assert pub('d3-r1')['reply'] == 'd3u1', pub('d3-r1')
+    print('D3 confirm OK: operator confirmation restored the reply link without a new publication')
+
+
+def step_d3_health_only(code):
+    # The quarantined input of the accept batch stays open by design; nothing else may be wrong.
+    def codes():
+        snap = b.read_health(STATE, float(os.environ['HEALTH_STALE_AFTER']), float(os.environ['HEALTH_QUEUE_AGE']))
+        return sorted({i['code'] for i in snap['issues']})
+    until(lambda: codes() == [code], f'health issues == [{code}]')
+    print(f'health OK: only {code} (open quarantine entry from the D3 accept batch)')
+
+
+def step_d3_hits(route):
+    print(mock_state()['hits'].get(route, 0))
+
 if __name__ == '__main__':
     globals()['step_' + sys.argv[1].replace('-', '_')](*sys.argv[2:])

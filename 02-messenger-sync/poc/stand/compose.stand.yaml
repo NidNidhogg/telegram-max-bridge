@@ -34,7 +34,10 @@ services:
     labels: *stand-label
     entrypoint: ["python", "/app/02-messenger-sync/poc/stand/stand_bridge.py"]
     env_file: !reset []
-    environment: *synthetic
+    environment:
+      <<: *synthetic
+      # D3 crash point, armed only for one container by stand.sh (empty = off).
+      STAND_FREEZE: ${STAND_FREEZE:-}
     networks:
       - stand
     depends_on:

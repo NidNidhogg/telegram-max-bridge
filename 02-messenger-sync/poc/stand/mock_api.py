@@ -176,6 +176,7 @@ async def max_upload(request):
 
 
 async def max_media(request):
+    await mock.gate('max_media')
     return web.Response(body=PNG)
 
 
@@ -184,6 +185,9 @@ async def ctl(request):
     body = await request.json() if request.can_read_body else {}
     if action == 'inject':
         (mock.tg_events if body['platform'] == 'tg' else mock.max_events).append(body['event'])
+    elif action == 'inject_many':
+        # D3: several events become visible to the same poll at once (one accepted batch).
+        (mock.tg_events if body['platform'] == 'tg' else mock.max_events).extend(body['events'])
     elif action == 'replay':
         mock.replay[body['platform']] = True
     elif action == 'max_publish':
