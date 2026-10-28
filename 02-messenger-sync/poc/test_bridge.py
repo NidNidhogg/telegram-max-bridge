@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 from contextlib import redirect_stdout
 import email.utils
@@ -9,6 +10,7 @@ import sys
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -935,6 +937,36 @@ except sqlite3.Error as exc:
         self.assertEqual(result.stdout.split(), ['before-commit', 'commit-error', 'OperationalError'], result)
         self.assert_nothing_acknowledged()
         self.assert_batch_once(self.open(), events)
+
+    def test_foreign_binding_is_rejected_before_the_queue_is_touched(self):
+        store = self.open()
+        store.accept('tg', [tg()], 2, '-100', '99')
+        with store.db:
+            store.set('identity', json.dumps(['1', '2', '-100', '-200']))
+            store.db.execute("UPDATE jobs SET state='sending'")
+        store.db.close()
+
+        class NoApi:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                pass
+
+        with patch.object(b, 'config', return_value={'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}), \
+                patch.object(b, 'Api', return_value=NoApi()), \
+                patch.object(b, 'doctor', AsyncMock(return_value={'tg': '99', 'max': '88'})), \
+                patch.object(b, 'run_bridge', AsyncMock()) as run:
+            with self.assertRaisesRegex(b.BridgeError, 'другой паре'):
+                asyncio.run(b.network_command(SimpleNamespace(command='run'), self.path.parent, self.path))
+        run.assert_not_awaited()
+        conn = sqlite3.connect(self.path)
+        try:
+            # recover() did not run: the foreign database is left exactly as it was.
+            self.assertEqual(conn.execute('SELECT state FROM jobs').fetchone()[0], 'sending')
+            self.assertEqual(json.loads(conn.execute("SELECT value FROM meta WHERE key='identity'").fetchone()[0])[0], '1')
+        finally:
+            conn.close()
 
     def test_recover_is_idempotent_and_keeps_every_state(self):
         store = self.open()
