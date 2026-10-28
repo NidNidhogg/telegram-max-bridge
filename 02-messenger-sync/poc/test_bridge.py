@@ -1,10 +1,12 @@
 import importlib.util
 from contextlib import redirect_stdout
+import email.utils
 import io
 import json
 import sqlite3
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -557,6 +559,242 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge(FakeApi()).deliver('max')
         self.assertEqual(self.jobs()[0]['remote_id'], 'copy1')
         self.assertEqual(self.jobs()[0]['state'], 'sent')
+
+
+
+class ScriptedApi(FakeApi):
+    """Each publication/preparation call consumes the next scripted outcome (None means success)."""
+    def __init__(self, publish=(), prepare=()):
+        super().__init__()
+        self.publish, self.prepare, self.prepared = list(publish), list(prepare), 0
+
+    async def request(self, service, path, **kwargs):
+        self.calls.append((service, path, kwargs))
+        outcome = self.publish.pop(0) if self.publish else None
+        if outcome:
+            raise outcome
+        return {'message': {'body': {'mid': f'copy{len(self.calls)}'}}} if service == 'max' else {'message_id': len(self.calls)}
+
+    async def prepare_photo(self, *args):
+        self.prepared += 1
+        outcome = self.prepare.pop(0) if self.prepare else None
+        if outcome:
+            raise outcome
+        return {'token': f'upload{self.prepared}'}
+
+
+class ResilienceTests(unittest.IsolatedAsyncioTestCase):
+    """D2: retry timing, classification of failures and reuse of prepared MAX attachments."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = b.Store(Path(self.tmp.name) / 'state.db')
+        self.cfg = {'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}
+
+    def tearDown(self):
+        self.store.db.close()
+        self.tmp.cleanup()
+
+    def bridge(self, api, rand=0.0):
+        bridge = b.Bridge(self.cfg, api, self.store, {'tg': '99', 'max': '88'}, send_intervals={'tg': 0, 'max': 0})
+        bridge.random = lambda: rand
+        return bridge
+
+    def job(self, jid=1):
+        return self.store.db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+
+    def make_ready(self):
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET ready=0')
+
+    def photo_job(self):
+        event = tg(text='подпись')
+        event['message']['photo'] = [{'file_id': 'image'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+
+    def test_retry_after_accepts_seconds_and_http_date(self):
+        now = 1_000_000_000.0
+        date = email.utils.formatdate(now + 90, usegmt=True)
+        cases = {'120': 120, ' 7 ': 7, 30: 30, 2.5: 2.5, date: 90,
+                 email.utils.formatdate(now - 90, usegmt=True): 0}
+        for value, expected in cases.items():
+            self.assertAlmostEqual(b.retry_after_seconds(value, now=now), expected, places=3, msg=repr(value))
+
+    def test_retry_after_rejects_invalid_values_without_raising(self):
+        invalid = [None, '', '  ', '-5', '1.5', '+3', 'soon', '٣', True, False, -1, 0, float('nan'),
+                   float('inf'), float('-inf'), {'s': 1}, [5], 'Wed, 99 Foo 2015 07:28:00 GMT',
+                   'Wed, 21 Oct 2015 07:28:00 -0000', 'Wed, 21 Oct 99999 07:28:00 GMT']
+        for value in invalid:
+            self.assertEqual(b.retry_after_seconds(value, now=0), 0, repr(value))
+        # Beyond float range: unusable hint, the caller falls back to its own backoff.
+        for huge in (10 ** 400, '9' * 400, '9' * 5000, 1e301):
+            self.assertEqual(b.retry_after_seconds(huge), 0, repr(huge)[:20])
+        self.assertEqual(b.retry_after_seconds('0' * 5000 + '7'), 7)
+        error = b.Api.error('max', 429, {'code': '429'}, '9' * 5000)
+        self.assertEqual((error.code, error.retry_after, error.status), ('429', 0, 429))
+
+    def test_server_delays_longer_than_a_day_are_not_shortened(self):
+        now, two_days = 1_000_000_000.0, 2 * 86400
+        self.assertEqual(b.retry_after_seconds(str(two_days), now=now), two_days)
+        date = email.utils.formatdate(now + two_days, usegmt=True)
+        self.assertAlmostEqual(b.retry_after_seconds(date, now=now), two_days, places=3)
+        self.assertEqual(b.Api.error('tg', 429, {'parameters': {'retry_after': two_days}}).retry_after, two_days)
+        self.assertEqual(b.retry_after_seconds(1e300), 1e300)
+
+    async def test_server_wait_longer_than_a_day_is_persisted(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        before = time.time()
+        await self.bridge(ScriptedApi(publish=[b.ApiError('max', 429, 2 * 86400, status=429)])).deliver('max')
+        self.assertEqual(self.job()['state'], 'pending')
+        self.assertGreaterEqual(self.job()['ready'], before + 2 * 86400)
+
+    async def test_http_5xx_after_publication_wins_over_retryable_body_code(self):
+        for mid, code in ((1, '429'), (2, 'attachment.not.ready')):
+            self.store.accept('tg', [tg(mid)], mid + 1, '-100', '99')
+            api = ScriptedApi(publish=[b.ApiError('max', code, 5, status=503)])
+            await self.bridge(api).deliver('max')
+            self.assertEqual((self.job(mid)['state'], len(api.calls)), ('uncertain', 1), code)
+            self.make_ready()
+            self.store.recover()
+            restarted = ScriptedApi()
+            await self.bridge(restarted).deliver('max')
+            self.assertEqual((self.job(mid)['state'], restarted.calls), ('uncertain', []), code)
+            self.store.update(mid, 'sent', remote_id=f'found{mid}', counted=True)
+
+    async def test_media_download_rejections_use_retry_after_or_fail(self):
+        self.photo_job()
+        before = time.time()
+        api = ScriptedApi(prepare=[b.ApiError('tg-media', 429, 60, status=429)])
+        await self.bridge(api).deliver('max')
+        self.assertEqual((self.job()['state'], api.calls), ('pending', []))
+        self.assertGreaterEqual(self.job()['ready'], before + 60)
+        self.make_ready()
+        api = ScriptedApi(prepare=[b.ApiError('tg-media', 404, status=404)])
+        await self.bridge(api).deliver('max')
+        self.assertEqual((self.job()['state'], api.calls), ('failed', []))
+
+    def test_api_error_takes_the_latest_of_telegram_and_http_hints(self):
+        error = b.Api.error('tg', 429, {'error_code': 429, 'parameters': {'retry_after': 5}}, '30')
+        self.assertEqual((error.code, error.retry_after), ('429', 30))
+        error = b.Api.error('tg', 429, {'error_code': 429, 'parameters': {'retry_after': 50}}, '30')
+        self.assertEqual(error.retry_after, 50)
+        error = b.Api.error('tg', 429, {'parameters': {'retry_after': 'nan'}}, 'bogus')
+        self.assertEqual(error.retry_after, 0)
+        # MAX does not document a JSON retry hint: only the HTTP header counts.
+        error = b.Api.error('max', 429, {'code': '429', 'parameters': {'retry_after': 500}}, None)
+        self.assertEqual((error.code, error.retry_after), ('429', 0))
+        self.assertEqual(b.Api.error('max', 503, {}, '12').retry_after, 12)
+
+    def test_backoff_is_positive_bounded_and_exponential(self):
+        self.assertEqual([b.backoff(n, 2, 120, rand=lambda: 0) for n in range(0, 9)],
+                         [2, 2, 4, 8, 16, 32, 64, 120, 120])
+        self.assertEqual(b.backoff(10 ** 6, 2, 120, rand=lambda: 1), 120 * (1 + b.BACKOFF_JITTER))
+        for rand in (-5.0, 0.0, 0.5, 1.0, 7.0):
+            delay = b.backoff(3, 2, 120, rand=lambda: rand)
+            self.assertTrue(8 <= delay <= 8 * (1 + b.BACKOFF_JITTER), (rand, delay))
+
+    async def test_connect_failure_during_publication_stays_pending_then_one_copy(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        api = ScriptedApi(publish=[b.ConnectError('synthetic')] * 3)
+        bridge = self.bridge(api)
+        delays = []
+        for _ in range(3):
+            before = time.time()
+            await bridge.deliver('max')
+            job = self.job()
+            self.assertEqual(job['state'], 'pending')
+            delays.append(job['ready'] - before)
+            await bridge.deliver('max')  # not yet due: no request
+            self.make_ready()
+        self.assertEqual(len(api.calls), 3)
+        self.assertTrue(delays[0] < delays[1] < delays[2] <= 120, delays)
+        await bridge.deliver('max')
+        self.assertEqual((self.job()['state'], len(api.calls)), ('sent', 4))
+
+    async def test_possible_publication_failures_become_uncertain_once(self):
+        for error in (b.TransportError('lost response'), b.ApiError('max', 503, 1), b.ApiError('max', 500)):
+            with self.subTest(error=error):
+                self.tearDown()
+                self.setUp()
+                self.store.accept('tg', [tg()], 2, '-100', '99')
+                api = ScriptedApi(publish=[error])
+                bridge = self.bridge(api)
+                await bridge.deliver('max')
+                self.make_ready()
+                await bridge.deliver('max')
+                self.assertEqual((self.job()['state'], len(api.calls)), ('uncertain', 1))
+
+    async def test_permanent_failures_stop_the_job_without_frequent_retries(self):
+        for error in (b.CertificateError('tls'), b.ApiError('max', 401), b.ApiError('max', 403),
+                      b.ApiError('max', 400)):
+            with self.subTest(error=error):
+                self.tearDown()
+                self.setUp()
+                self.store.accept('tg', [tg()], 2, '-100', '99')
+                api = ScriptedApi(publish=[error])
+                bridge = self.bridge(api)
+                for _ in range(3):
+                    await bridge.deliver('max')
+                    self.make_ready()
+                self.assertEqual((self.job()['state'], len(api.calls)), ('failed', 1))
+
+    async def test_photo_preparation_failures_back_off_and_success_resets(self):
+        self.photo_job()
+        self.store.accept('tg', [tg(2, 'дальше')], 3, '-100', '99')
+        api = ScriptedApi(prepare=[b.TransportError('download'), b.ApiError('tg', 502), b.ConnectError('dns')])
+        bridge = self.bridge(api)
+        delays = []
+        for _ in range(3):
+            before = time.time()
+            await bridge.deliver('max')
+            self.assertEqual(self.job()['state'], 'pending')
+            delays.append(self.job()['ready'] - before)
+            self.make_ready()
+        self.assertTrue(1.9 < delays[0] < delays[1] < delays[2], delays)
+        self.assertEqual(api.calls, [])
+        await bridge.deliver('max')
+        self.assertEqual((self.job()['state'], api.prepared), ('sent', 4))
+        api.publish = [b.ConnectError('next')]
+        before = time.time()
+        await bridge.deliver('max')
+        self.assertLess(self.job(2)['ready'] - before, 2.1)
+
+    async def test_attachment_not_ready_reuses_the_upload_and_publishes_once(self):
+        self.photo_job()
+        not_ready = b.ApiError('max', 'attachment.not.ready')
+        api = ScriptedApi(publish=[not_ready, not_ready])
+        bridge = self.bridge(api)
+        for _ in range(3):
+            await bridge.deliver('max')
+            self.make_ready()
+        self.assertEqual((self.job()['state'], api.prepared, len(api.calls)), ('sent', 1, 3))
+        payloads = [call[2]['body']['attachments'] for call in api.calls]
+        self.assertEqual(payloads, [[{'type': 'image', 'payload': {'token': 'upload1'}}]] * 3)
+        self.assertEqual(bridge.prepared, {})
+
+    async def test_expired_prepared_attachment_is_uploaded_again(self):
+        self.photo_job()
+        api = ScriptedApi(publish=[b.ApiError('max', 429)])
+        bridge = self.bridge(api)
+        await bridge.deliver('max')
+        self.make_ready()
+        with patch.object(b, 'ATTACHMENT_REUSE', -1):
+            bridge.prepared = {k: (v[0] - 10_000, v[1]) for k, v in bridge.prepared.items()}
+            await bridge.deliver('max')
+        self.assertEqual((self.job()['state'], api.prepared), ('sent', 2))
+
+    async def test_retry_after_longer_than_backoff_is_respected(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        api = ScriptedApi(publish=[b.ApiError('max', 429, 3000)])
+        before = time.time()
+        await self.bridge(api).deliver('max')
+        self.assertGreaterEqual(self.job()['ready'], before + 3000)
+
+    async def test_database_errors_are_not_masked_as_network_retries(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        api = ScriptedApi(publish=[sqlite3.OperationalError('disk I/O error')])
+        with self.assertRaises(sqlite3.OperationalError):
+            await self.bridge(api).deliver('max')
+        self.assertEqual(self.job()['state'], 'sending')
 
 
 if __name__ == '__main__':

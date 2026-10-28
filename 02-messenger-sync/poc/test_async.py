@@ -1,6 +1,7 @@
 """Async transport/runtime checks against a real local HTTP server; no live tokens."""
 import asyncio
 from contextlib import redirect_stdout
+import email.utils
 import io
 import gzip
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import ssl
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -19,6 +21,14 @@ from aiohttp import web
 
 import bridge as b
 from smoke_p0 import tg, mx
+
+
+def closed_port_url():
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return f'http://127.0.0.1:{port}'
 
 
 class HttpServer(unittest.IsolatedAsyncioTestCase):
@@ -232,15 +242,52 @@ class HttpTests(HttpServer):
                 cfg = {'TG_BOT_TOKEN': 'synthetic', 'MAX_BOT_TOKEN': 'synthetic', 'MAX_CA_FILE': str(cert)}
                 async with b.Api(cfg, tg_base=base, max_base=base) as api:
                     await api.request('max', '/me')
-                    with self.assertRaises(b.TransportError):
+                    with self.assertRaises(b.CertificateError):
                         await api.request('tg', 'getMe')
                     api.max_base = f'https://localhost:{port}'
-                    with self.assertRaises(b.TransportError):
+                    with self.assertRaises(b.CertificateError):
                         await api.request('max', '/me')
                 await asyncio.sleep(0.05)
             finally:
                 await runner.cleanup()
                 loop.set_exception_handler(previous_handler)
+
+
+class ResilienceHttpTests(HttpServer):
+    async def test_refused_connection_is_provably_unsent_for_both_platforms(self):
+        api = await self.api()
+        api.tg_base = api.max_base = closed_port_url()
+        for service, path in (('tg', 'sendMessage'), ('max', '/messages')):
+            with self.assertRaises(b.ConnectError) as caught:
+                await api.request(service, path, method='POST', body={'text': 'synthetic'})
+            self.assertNotIn('PRIVATE', str(caught.exception))
+        self.assertEqual(self.calls, [])
+
+    async def test_http_retry_after_seconds_date_and_invalid_for_both_platforms(self):
+        api = await self.api()
+        cases = [('30', 30), (email.utils.formatdate(time.time() + 60, usegmt=True), 60),
+                 ('soon', 0), ('-4', 0), ('Wed, 99 Foo 2015 07:28:00 GMT', 0)]
+        for header, expected in cases:
+            for service, path, body in (('tg', 'sendMessage', {'ok': False, 'error_code': 429}),
+                                        ('max', '/messages', {'code': 'too.many.requests'})):
+                with self.subTest(header=header, service=service):
+                    self.handler = lambda request, _b, body=body, header=header: web.json_response(
+                        body, status=429, headers={'Retry-After': header})
+                    with self.assertRaises(b.ApiError) as caught:
+                        await api.request(service, path, method='POST', body={'text': 'synthetic'})
+                    self.assertEqual(caught.exception.code, '429')
+                    self.assertAlmostEqual(caught.exception.retry_after, expected, delta=2)
+
+
+    async def test_long_numeric_retry_after_keeps_a_definite_429(self):
+        api = await self.api()
+        for service, path, body in (('tg', 'sendMessage', {'ok': False, 'error_code': 429}),
+                                    ('max', '/messages', {'code': 'too.many.requests'})):
+            self.handler = lambda request, _b, body=body: web.json_response(
+                body, status=429, headers={'Retry-After': '9' * 5000})
+            with self.assertRaises(b.ApiError) as caught:
+                await api.request(service, path, method='POST', body={'text': 'synthetic'})
+            self.assertEqual((caught.exception.code, caught.exception.retry_after), ('429', 0))
 
 
 class RuntimeTests(HttpServer):
@@ -434,7 +481,7 @@ class RuntimeTests(HttpServer):
 
         def handle(request, body):
             if request.path == '/messages':
-                return web.json_response({'parameters': {'retry_after': 120}}, status=429)
+                return web.json_response({'code': 'too.many.requests'}, status=429, headers={'Retry-After': '120'})
             return self.normal(request, body)
 
         self.handler = handle
@@ -461,6 +508,118 @@ class RuntimeTests(HttpServer):
         await asyncio.sleep(0.05)
         self.assertEqual(sum(c[1] == '/updates' for c in self.calls), 1)
         self.assertIsNotNone(self.store.get('last_poll_error_max'))
+        self.assertFalse(task.done())
+        stop.set()
+        await task
+
+    async def test_poll_backoff_grows_to_cap_and_resets_after_success(self):
+        moments, outcomes = [], [503, 503, 503, 503, 200, 503, 200]
+
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                moments.append(time.monotonic())
+                status = outcomes[len(moments) - 1] if len(moments) <= len(outcomes) else 200
+                if status != 200:
+                    return web.json_response({'ok': False, 'error_code': status}, status=status)
+            return self.normal(request, body)
+
+        self.handler = handle
+        self.bridge.random = lambda: 1.0
+        with patch.object(b, 'POLL_BACKOFF', (0.04, 0.16)):
+            stop, task = self.start()
+            await self.until(lambda: len(moments) >= 8)
+            stop.set()
+            await task
+        gaps = [b - a for a, b in zip(moments, moments[1:])]
+        top = 0.16 * (1 + b.BACKOFF_JITTER)
+        for gap, minimum in zip(gaps, (0.048, 0.096, top, top)):
+            self.assertGreaterEqual(gap, minimum - 0.005, gaps)
+        self.assertLess(max(gaps[:4]), top + 0.15, gaps)
+        self.assertLess(gaps[5], 0.096, gaps)  # first failure after a success starts from the base again
+
+    async def test_stop_interrupts_a_long_retry_wait(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': False, 'error_code': 502}, status=502)
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'POLL_BACKOFF', (60, 60)):
+            stop, task = self.start()
+            await self.until(lambda: self.store.get('last_poll_failure_tg') is not None)
+            started = time.monotonic()
+            stop.set()
+            await asyncio.wait_for(task, 2)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(sum(c[1] == '/getUpdates' for c in self.calls), 1)
+
+    async def test_max_outage_keeps_telegram_and_heartbeat_then_delivers_once_in_order(self):
+        self.store.accept('tg', [tg(1), tg(2), tg(3)], 4, '-100', '99')
+        self.store.accept('max', [mx('one')], 1, '-200', '88')
+        working, refused = self.client.max_base, []
+        real_read = self.client.read
+
+        async def counting_read(platform, url, **kwargs):
+            try:
+                return await real_read(platform, url, **kwargs)
+            except b.ConnectError:
+                refused.append(url)
+                raise
+
+        self.client.read = counting_read
+        self.client.max_base = closed_port_url()
+        with patch.object(b, 'SEND_BACKOFF', (0.02, 0.05)), patch.object(b, 'POLL_BACKOFF', (0.02, 0.05)):
+            stop, task = self.start()
+            await self.until(lambda: self.state(4) == 'sent' and sum('/messages' in u for u in refused) >= 3)
+            before = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != before)
+            self.assertEqual([self.state(i) for i in (1, 2, 3)], ['pending'] * 3)
+            self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 0)
+            self.assertIsNotNone(self.store.get('last_poll_error_max'))
+            self.client.max_base = working
+            await self.until(lambda: [self.state(i) for i in (1, 2, 3)] == ['sent'] * 3)
+            stop.set()
+            await task
+        self.assertEqual(sum(c[1] == '/messages' for c in self.calls), 3)
+        remote = [self.store.db.execute('SELECT remote_id FROM jobs WHERE id=?', (i,)).fetchone()[0] for i in (1, 2, 3)]
+        self.assertEqual(remote, sorted(remote, key=lambda r: int(r.split('-')[1])))
+        self.assertEqual(self.store.get('cursor_tg'), '4')
+
+    async def test_retry_after_header_delays_the_real_next_publication(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        moments = []
+
+        def handle(request, body):
+            if request.path == '/messages':
+                moments.append(time.monotonic())
+                if len(moments) == 1:
+                    return web.json_response({'code': 'too.many.requests'}, status=429, headers={'Retry-After': '1'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'SEND_BACKOFF', (0.01, 0.01)):
+            stop, task = self.start()
+            await self.until(lambda: self.state() == 'sent')
+            stop.set()
+            await task
+        self.assertEqual(len(moments), 2)
+        self.assertGreaterEqual(moments[1] - moments[0], 1.0)
+
+    async def test_certificate_failure_pauses_only_that_platform(self):
+        self.store.accept('max', [mx('one')], 1, '-200', '88')
+        real_poll, attempts = self.bridge.poll, []
+
+        async def poll(platform):
+            if platform == 'max':
+                attempts.append(platform)
+                raise b.CertificateError('Ошибка проверки TLS-сертификата')
+            return await real_poll(platform)
+
+        self.bridge.poll = poll
+        stop, task = self.start()
+        await self.until(lambda: 'max' in self.bridge.paused and self.state() == 'sent')
+        await asyncio.sleep(0.05)
+        self.assertEqual(attempts, ['max'])
         self.assertFalse(task.done())
         stop.set()
         await task
@@ -604,6 +763,76 @@ class RuntimeTests(HttpServer):
         self.assertIn(b'"message_id": 75', payload)
         self.assertIn(b'\x89PNG\r\n\x1a\nsynthetic', payload)
         self.assertIn(b'synthetic', payload)
+
+
+    def posts(self, path):
+        return sum(1 for c in self.calls if c[1] == path)
+
+    async def test_http_503_with_retryable_body_after_publication_is_uncertain_once(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return web.json_response({'code': '429'}, status=503, headers={'Retry-After': '1'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        await self.bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET ready=0')
+        restarted = b.Store(Path(self.tmp.name) / 'bridge.sqlite3')
+        self.addCleanup(restarted.db.close)
+        bridge = b.Bridge({'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}, self.client, restarted,
+                          {'tg': '99', 'max': '88'}, send_intervals={'tg': 0, 'max': 0})
+        await bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+
+    async def test_photo_download_429_and_404_through_deliver_both_directions(self):
+        event = tg(1)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+        event = mx('2')
+        event['message']['body']['attachments'] = [{'type': 'image', 'payload': {'url': self.url + '/image'}}]
+        self.store.accept('max', [event], 2, '-200', '88')
+        self.client.tg_file_base = self.url + '/files'
+        media = {'status': 429}
+
+        def handle(request, body):
+            if request.path == '/getFile':
+                return web.json_response({'ok': True, 'result': {'file_path': 'image.jpg'}})
+            if request.path in ('/files/image.jpg', '/image'):
+                return web.Response(status=media['status'], headers={'Retry-After': '60'}, text='synthetic')
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media):
+            for destination, jid in (('max', 1), ('tg', 2)):
+                media['status'] = 429
+                before = time.time()
+                await self.bridge.deliver(destination)
+                job = self.store.db.execute('SELECT state, ready FROM jobs WHERE id=?', (jid,)).fetchone()
+                self.assertEqual(job[0], 'pending', destination)
+                self.assertGreaterEqual(job[1], before + 60, destination)
+                with self.store.db:
+                    self.store.db.execute('UPDATE jobs SET ready=0')
+                media['status'] = 404
+                await self.bridge.deliver(destination)
+                self.assertEqual(self.state(jid), 'failed', destination)
+        self.assertEqual(self.posts('/messages') + self.posts('/sendPhoto'), 0)
+
+    async def test_long_retry_after_on_poll_does_not_stop_the_runtime(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': False, 'error_code': 429}, status=429,
+                                         headers={'Retry-After': '9' * 5000})
+            return self.normal(request, body)
+
+        self.handler = handle
+        _, task = self.start()
+        await self.until(lambda: self.posts('/getUpdates') >= 1 and self.posts('/updates') >= 5)
+        self.assertFalse(task.done())
+        self.assertNotIn('tg', self.bridge.paused)
 
 
 if __name__ == '__main__':

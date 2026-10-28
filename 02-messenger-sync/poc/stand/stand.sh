@@ -1,6 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2086,SC2016,SC2046  # $C is intentionally word-split; quoted scripts run in the container
-# Isolated container stand for D1: synthetic tokens, mock Telegram/MAX API on an internal
+# Isolated container stand for D1/D2: synthetic tokens, mock Telegram/MAX API on an internal
 # network, its own Compose project, image tag and volumes. Never touches the working project.
 set -eu
 cd "$(dirname "$0")/../../.."
@@ -61,8 +61,10 @@ $C up -d --wait --wait-timeout 120 mockapi bridge monitor
 step 'isolation and hardening'
 for service in bridge monitor; do
     id=$($C ps -q $service)
-    docker inspect -f '{{.Config.User}} privileged={{.HostConfig.Privileged}} ports={{json .HostConfig.PortBindings}} mounts={{range .Mounts}}{{.Destination}} {{end}}' "$id" | tee /dev/stderr \
-        | grep -q '^10001:10001 privileged=false ports={} mounts=/state $'
+    # No `tee /dev/stderr`: reopening it truncates a stand log redirected to a file.
+    info=$(docker inspect -f '{{.Config.User}} privileged={{.HostConfig.Privileged}} ports={{json .HostConfig.PortBindings}} mounts={{range .Mounts}}{{.Destination}} {{end}}' "$id")
+    echo "$info" >&2
+    [ "$info" = '10001:10001 privileged=false ports={} mounts=/state ' ]
 done
 $C exec -T bridge sh -ec 'test "$(id -u)" = 10001; tr "\0" " " </proc/1/cmdline | grep -q docker-init
     ! find / -xdev \( -path /proc -o -path /app/.venv -o -path /state \) -prune -o \( -name ".env" -o -name ".env.*" -o -name ".state" -o -name "*.sqlite3*" -o -name "*.jsonl" \) -print 2>/dev/null | grep .'
@@ -149,6 +151,37 @@ echo 'update OK: state kept; failed build left the running container untouched'
 
 step 'monitor service wrote problem and recovery alerts to the shared volume'
 ctl alerts
+
+step 'D2: Telegram poll outage (3x 503) with backoff; MAX and heartbeat continue'
+ctl d2-tg-poll-outage
+
+step 'D2: MAX connections refused (requests provably not sent); jobs stay pending'
+ctl d2-max-connect-outage
+
+step 'D2: 429 with Retry-After seconds / HTTP-date is honoured on both platforms'
+ctl d2-rate-limit
+
+step 'D2: photo download failures both ways; MAX attachment.not.ready reuses the upload'
+ctl d2-photo-retry
+
+for scenario in 'error_after d2-5xx 641' 'drop_after d2-drop 642'; do
+    set -- $scenario
+    step "D2: $1 after a possible publication stays uncertain across recreation"
+    set -- $(ctl d2-uncertain "$@") "$2" "$3"
+    $C up -d --force-recreate --no-deps bridge
+    ctl d2-uncertain-stays "$3" "$4"
+    ctl health delivery_blocked
+    $M COMPOSE="$C" stop-bridge
+    $M COMPOSE="$C" cli ARGS="queue confirm $1 --remote-id $2 --reason 'stand: copy found in target group'"
+    $C start bridge
+done
+health_is healthy
+
+step 'D2: recreation while a retry is scheduled keeps the job, reply link and retry time'
+ready=$(ctl d2-wait-start)
+$C up -d --force-recreate --no-deps bridge
+ctl d2-wait-check "$ready"
+health_is healthy
 
 echo
 echo 'Container stand passed: synthetic data only, no real API calls'

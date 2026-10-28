@@ -9,12 +9,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge as b  # noqa: E402
 
 BASE = os.environ['STAND_API_BASE']
+MAX_BASE = os.environ.get('STAND_MAX_BASE', BASE)
 MOCK_HOST = urllib.parse.urlsplit(BASE).hostname
 RealApi, RealBridge, real_check = b.Api, b.Bridge, b.check_media_url
 
 
 def stand_api(cfg):
-    return RealApi(cfg, tg_base=BASE + '/tg', max_base=BASE + '/max', tg_file_base=BASE + '/tgfile')
+    return RealApi(cfg, tg_base=BASE + '/tg', max_base=MAX_BASE + '/max', tg_file_base=BASE + '/tgfile')
 
 
 def stand_bridge(cfg, api, store, ids):

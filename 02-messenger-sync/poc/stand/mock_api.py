@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 
 from aiohttp import web
@@ -24,6 +25,9 @@ class Mock:
         self.replay = {'tg': False, 'max': False}
         self.polls = {'tg': 0, 'max': 0}
         self.holds, self.entered = {}, {}
+        # D2: scripted failures {route: {status, count, body, headers}} and request timestamps.
+        self.faults, self.hits, self.fault_times = {}, {}, {}
+        self.max_site, self.max_connections = None, set()
 
     def save(self):
         DATA.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +55,45 @@ mock = Mock()
 
 def tg_ok(result):
     return web.json_response({'ok': True, 'result': result})
+
+
+def route_of(request):
+    parts = request.path.strip('/').split('/', 1)
+    if parts[0] == 'tg':
+        return 'tg:' + parts[1]
+    if parts[0] == 'max':
+        return 'max:/' + parts[1]
+    return parts[0]
+
+
+@web.middleware
+async def faults(request, handler):
+    route = route_of(request)
+    if route == '_ctl':
+        return await handler(request)
+    if request.transport is not None and request.transport.get_extra_info('sockname')[1] == 8081:
+        mock.max_connections.add(request.transport)
+    mock.hits.setdefault(route, []).append(time.time())
+    fault = mock.faults.get(route)
+    if fault and fault['count'] > 0:
+        fault['count'] -= 1
+        mock.fault_times.setdefault(route, []).append(time.time())
+        await request.read()
+        return web.json_response(fault.get('body', {}), status=fault['status'], headers=fault.get('headers', {}))
+    return await handler(request)
+
+
+async def max_listen(on):
+    if on and mock.max_site is None:
+        mock.max_site = web.TCPSite(runner, '0.0.0.0', 8081)
+        await mock.max_site.start()
+    elif not on and mock.max_site is not None:
+        await mock.max_site.stop()
+        mock.max_site = None
+        # Close idle keep-alive connections too, so the next request must connect (and be refused).
+        for transport in mock.max_connections:
+            transport.close()
+        mock.max_connections.clear()
 
 
 async def tg_api(request):
@@ -111,6 +154,13 @@ async def max_api(request):
         body = await request.json()
         kind = 'photo' if body.get('attachments') else 'text'
         reply = (body.get('link') or {}).get('mid')
+        if mock.max_publish in ('error_after', 'drop_after'):
+            mock.publish('max', kind, body.get('text'), reply)
+            if mock.max_publish == 'drop_after':
+                request.transport.abort()
+                return web.Response()
+            # Contradictory body: HTTP 503 must still win over the retryable code.
+            return web.json_response({'code': '429'}, status=503)
         if mock.max_publish == '429':
             mock.publish('max', kind, body.get('text'), reply, status='rejected')
             return web.json_response({'code': '429', 'message': 'synthetic rate limit'}, status=429)
@@ -143,14 +193,22 @@ async def ctl(request):
         mock.entered[body['name']] = 0
     elif action == 'release':
         mock.holds.pop(body['name']).set()
+    elif action == 'fault':
+        mock.faults[body['route']] = body
+    elif action == 'max_listen':
+        await max_listen(body['on'])
     elif action != 'state':
         return web.json_response({'error': action}, status=404)
     mock.save()
     return web.json_response({'publications': mock.publications, 'polls': mock.polls,
-                              'entered': mock.entered, 'max_publish': mock.max_publish})
+                              'entered': mock.entered, 'max_publish': mock.max_publish,
+                              'hits': {k: len(v) for k, v in mock.hits.items()},
+                              'last_hits': {k: v[-30:] for k, v in mock.hits.items()},
+                              'fault_times': mock.fault_times,
+                              'faults_left': {k: v['count'] for k, v in mock.faults.items()}})
 
 
-app = web.Application()
+app = web.Application(middlewares=[faults])
 app.router.add_route('*', '/tg/{method}', tg_api)
 app.router.add_get('/tgfile/{path:.*}', tg_file)
 app.router.add_route('*', '/max/{path:.*}', max_api)
@@ -158,5 +216,16 @@ app.router.add_post('/maxupload', max_upload)
 app.router.add_get('/maxmedia/{name}', max_media)
 app.router.add_route('*', '/_ctl/{action}', ctl)
 
+runner = web.AppRunner(app)
+
+
+async def main():
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 8080).start()
+    # MAX Bot API is also served on 8081, so the stand can refuse MAX connections only.
+    await max_listen(True)
+    await asyncio.Event().wait()
+
+
 if __name__ == '__main__':
-    web.run_app(app, host='0.0.0.0', port=8080, print=None)
+    asyncio.run(main())
