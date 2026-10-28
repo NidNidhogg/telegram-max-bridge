@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the unmodified bridge CLI against the stand mock API (test stand only)."""
+import json
 import os
+import signal
 import sys
 import urllib.parse
 from pathlib import Path
@@ -28,6 +30,45 @@ def stand_check(url):
 
 
 b.Api, b.Bridge, b.check_media_url = stand_api, stand_bridge, stand_check
+
+# D3 crash points: STAND_FREEZE=<point>:<marker>. The process stops itself (SIGSTOP) exactly
+# at the point; stand.sh observes SQLite and the mock, then kills the container with SIGKILL.
+POINT, _, MARKER = os.environ.get('STAND_FREEZE', '').partition(':')
+RealStore = b.Store
+
+
+def freeze():
+    print(f'stand: frozen at crash point {POINT}', file=sys.stderr, flush=True)
+    os.kill(os.getpid(), signal.SIGSTOP)
+
+
+def marked(store, jid):
+    row = store.db.execute('SELECT payload FROM jobs WHERE id=?', (jid,)).fetchone()
+    return MARKER in row[0]
+
+
+class StandStore(RealStore):
+    def accept_one(self, platform, event, chat_id, own_id):
+        super().accept_one(platform, event, chat_id, own_id)
+        if POINT == 'accept' and MARKER in json.dumps(event, ensure_ascii=False):
+            freeze()  # inside the accept transaction, before COMMIT
+
+    def start_sending(self, job):
+        claimed = super().start_sending(job)
+        if POINT == 'sending' and claimed and MARKER in job['payload']:
+            freeze()  # sending committed, POST not started
+        return claimed
+
+    def update(self, jid, state, *args, **kwargs):
+        if POINT == 'publish' and state == 'sent' and marked(self, jid):
+            freeze()  # API accepted the publication, result not committed
+        super().update(jid, state, *args, **kwargs)
+        if POINT == 'sent' and state == 'sent' and marked(self, jid):
+            freeze()  # sent and remote ID committed
+
+
+if MARKER:
+    b.Store = StandStore
 
 if __name__ == '__main__':
     try:

@@ -504,8 +504,13 @@ class Store:
             finally:
                 backup.close()
             backup_path.chmod(0o600)
+        # Durability settings are explicit and verified instead of relying on build defaults.
+        mode = self.db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower()
+        self.db.execute('PRAGMA synchronous=FULL')
+        synchronous = self.db.execute('PRAGMA synchronous').fetchone()[0]
+        if mode != ('memory' if str(path) == ':memory:' else 'wal') or synchronous != 2:
+            raise BridgeError('SQLite не включил WAL и synchronous=FULL; запуск остановлен, база не изменена')
         self.db.executescript('''
-            PRAGMA journal_mode=WAL;
             BEGIN IMMEDIATE;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS inbox(

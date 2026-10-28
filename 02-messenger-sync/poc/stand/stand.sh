@@ -1,6 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2086,SC2016,SC2046  # $C is intentionally word-split; quoted scripts run in the container
-# Isolated container stand for D1/D2: synthetic tokens, mock Telegram/MAX API on an internal
+# Isolated container stand for D1–D3: synthetic tokens, mock Telegram/MAX API on an internal
 # network, its own Compose project, image tag and volumes. Never touches the working project.
 set -eu
 cd "$(dirname "$0")/../../.."
@@ -182,6 +182,122 @@ ready=$(ctl d2-wait-start)
 $C up -d --force-recreate --no-deps bridge
 ctl d2-wait-check "$ready"
 health_is healthy
+
+# D3 crash points: stand_bridge.py stops itself (SIGSTOP) at the armed point, the script checks
+# SQLite and the mock, then SIGKILLs the container and starts a new, unarmed one.
+arm() { STAND_FREEZE=$1 $C up -d --force-recreate --no-deps bridge; }
+fresh() { $C up -d --force-recreate --no-deps bridge; }
+# The restart policy is switched off first: an automatic restart must not race with the checks.
+crash() {
+    docker update --restart=no "$(cid)" >/dev/null
+    docker kill -s KILL "$(cid)" >/dev/null
+    echo 'SIGKILL sent to the bridge container'
+}
+frozen() {
+    i=0
+    while [ $i -lt 120 ]; do
+        pid=$($C exec -T bridge python -c "$pid_cmd" 2>/dev/null) || pid=
+        if [ -n "$pid" ] && [ "$($C exec -T bridge cut -d' ' -f3 "/proc/$pid/stat" 2>/dev/null)" = T ]; then
+            echo "bridge stopped itself at the crash point (pid $pid)"; return 0
+        fi
+        i=$((i + 1)); sleep 0.5
+    done
+    echo 'bridge did not reach the crash point' >&2; exit 1
+}
+
+step 'D3: SIGKILL inside the accept transaction; the redelivered batch is accepted once'
+arm accept:d3-freeze-accept
+set -- $(ctl d3-accept-start)
+frozen
+ctl d3-accept-frozen "$@"
+crash
+fresh
+ctl d3-accept-check "$@"
+
+step 'D3: own-bot echo, other bots and identical texts'
+ctl d3-echo
+
+step 'D3: SIGKILL during photo preparation in both directions'
+ctl d3-photo-start
+crash
+fresh
+ctl d3-photo-release
+ctl d3-photo-check
+
+step 'D3: SIGKILL right after the sent COMMIT; redelivery does not publish again'
+arm sent:tg741
+ctl d3-inject tg tg741 'tg741 d3-c1'
+frozen
+ctl d3-frozen tg 741 sent tg741 1
+crash
+fresh
+ctl d3-kept tg 741 sent tg741 1 tg >/dev/null
+ctl d3-sent-reply
+
+step 'D3: long message, SIGKILL after part 0 sent; part 1 continues, part 0 not repeated'
+arm sent:tg751
+ctl d3-inject tg tg751 long
+frozen
+ctl d3-frozen tg 751 sent,pending tg751 1
+crash
+fresh
+ctl d3-kept tg 751 sent,sent tg751 1 >/dev/null
+
+step 'D3: SIGKILL after part 1 claimed (sending) before its POST'
+arm sending:tg761-tail
+ctl d3-inject tg tg761 long tg761-tail
+frozen
+ctl d3-frozen tg 761 sent,sending tg761 1
+crash
+fresh
+ctl d3-kept tg 761 sent,uncertain tg761 1 tg >/dev/null
+ctl d3-other-direction
+fresh
+set -- $(ctl d3-kept tg 761 sent,uncertain tg761 1)
+skip_id=$1
+
+step 'D3: SIGKILL after the API accepted a publication, before the result COMMIT'
+arm publish:maxd3u1
+ctl d3-inject max d3u1 'maxd3u1 d3-u1'
+frozen
+ctl d3-frozen max d3u1 sending maxd3u1 1
+crash
+fresh
+ctl d3-kept max d3u1 uncertain maxd3u1 1 max >/dev/null
+fresh
+set -- $(ctl d3-kept max d3u1 uncertain maxd3u1 1)
+confirm_id=$1 confirm_remote=$2
+
+step 'D3: read-only diagnostics do not change the stopped database; operator resolves uncertain'
+$M COMPOSE="$C" stop-bridge
+# Logical snapshot (user_version, schema, all rows); WAL/SHM files may legitimately appear on read.
+before=$(ctl d3-snapshot)
+fail() { echo "read-only check: $*" >&2; exit 1; }
+$M COMPOSE="$C" status >/dev/null || fail 'make status failed'
+if $M COMPOSE="$C" health >/dev/null; then fail 'make health reported ok for a stopped bridge'; fi
+out=$($M -s COMPOSE="$C" cli ARGS='status --json') || fail 'status --json failed'
+case "$out" in *'"schema_version": 3'*'process_stopped'*) ;; *) fail "unexpected status: $out" ;; esac
+if out=$($M -s COMPOSE="$C" cli ARGS='health --json'); then fail 'health --json reported ok'; fi
+case "$out" in *'"ok": false'*'process_stopped'*) ;; *) fail "unexpected health: $out" ;; esac
+for what in queue quarantine; do
+    out=$($M -s COMPOSE="$C" cli ARGS="$what list") || fail "$what list failed"
+    case "$out" in '['*']') ;; *) fail "unexpected $what list: $out" ;; esac
+done
+[ "$before" = "$(ctl d3-snapshot)" ] || fail 'diagnostics changed data, schema or delivery states'
+echo "read-only OK: status/health (exit 0/1, JSON) and queue/quarantine list kept logical snapshot $before"
+$M COMPOSE="$C" cli ARGS="queue skip $skip_id --reason 'stand: uncertain part never published'"
+$M COMPOSE="$C" cli ARGS="queue confirm $confirm_id --remote-id $confirm_remote --reason 'stand: copy found in target group'"
+$C start bridge
+ctl d3-health-only input_quarantine
+ctl d3-confirm-reply
+
+step 'D3: a second bridge on the same volume is refused before polling or publishing'
+hits=$(ctl d3-hits tg:getMe)
+if out=$($C run --rm --no-deps -T bridge 2>&1); then echo 'second bridge started' >&2; exit 1; fi
+echo "$out" | grep -q 'Другой процесс использует прототип' || { echo "$out" >&2; exit 1; }
+[ "$hits" = "$(ctl d3-hits tg:getMe)" ] || { echo 'second bridge contacted the API' >&2; exit 1; }
+echo 'owner lock OK: second instance refused before any API call; lock file was never removed'
+ctl d3-health-only input_quarantine
 
 echo
 echo 'Container stand passed: synthetic data only, no real API calls'

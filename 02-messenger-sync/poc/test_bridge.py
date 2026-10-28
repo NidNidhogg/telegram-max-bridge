@@ -1,12 +1,16 @@
+import asyncio
 import importlib.util
 from contextlib import redirect_stdout
 import email.utils
 import io
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -795,6 +799,231 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.OperationalError):
             await self.bridge(api).deliver('max')
         self.assertEqual(self.job()['state'], 'sending')
+
+
+class DurabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / 'bridge.sqlite3'
+
+    def open(self):
+        store = b.Store(self.path)
+        self.addCleanup(store.db.close)
+        return store
+
+    def batch(self, count=3, size=100):
+        # Several messages, one of them split into parts, and one quarantined event.
+        events = [tg(i, f'msg-{i}-' + 'x' * size) for i in range(1, count + 1)]
+        events.append(tg(count + 1, 'длинное ' * 600))
+        events.append({'update_id': count + 2, 'message': {'message_id': count + 2, 'chat': {'id': -100},
+                       'from': {'id': 10}, 'photo': [{'file_size': 1}]}})
+        return events
+
+    def assert_nothing_acknowledged(self):
+        with sqlite3.connect(self.path) as conn:
+            counts = [conn.execute(f'SELECT count(*) FROM {t}').fetchone()[0] for t in ('jobs', 'inbox', 'quarantine')]
+            cursor = conn.execute("SELECT value FROM meta WHERE key='cursor_tg'").fetchone()
+            self.assertEqual(conn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+        self.assertEqual((counts, cursor), ([0, 0, 0], None))
+
+    def assert_batch_once(self, store, events):
+        store.accept('tg', events, 99, '-100', '99')
+        store.accept('tg', events, 99, '-100', '99')
+        parts = len(b.units(b.normalize('tg', events[-2], '-100', '99')))
+        self.assertGreater(parts, 1)
+        jobs = store.db.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        self.assertEqual(jobs, len(events) - 2 + parts)
+        self.assertEqual(store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 1)
+        self.assertEqual(store.get('cursor_tg'), '99')
+
+    def test_writer_uses_verified_wal_and_full_synchronous(self):
+        store = self.open()
+        self.assertEqual(store.db.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+        self.assertEqual(store.db.execute('PRAGMA synchronous').fetchone()[0], 2)
+        store.accept('tg', [tg()], 2, '-100', '99')
+        store.db.close()
+        # Committed data is visible to a fresh connection; WAL mode is persistent.
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+            self.assertEqual(conn.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+
+    def test_settings_failure_stops_start_without_changing_the_database(self):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute('CREATE TABLE keep(x)')
+        original = self.path.read_bytes()
+        blocker = sqlite3.connect(self.path)
+        blocker.execute('BEGIN IMMEDIATE')
+        try:
+            # Switching to WAL needs an exclusive lock: a real SQLITE_BUSY stops the start.
+            with self.assertRaises(sqlite3.OperationalError):
+                b.Store(self.path)
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_corrupt_or_newer_database_is_refused_and_kept(self):
+        self.path.write_bytes(b'not a database' * 100)
+        with self.assertRaises(sqlite3.DatabaseError):
+            b.Store(self.path)
+        self.assertEqual(self.path.read_bytes(), b'not a database' * 100)
+        self.path.unlink()
+        self.open().db.execute(f'PRAGMA user_version={b.SCHEMA_VERSION + 1}')
+        original = self.path.read_bytes()
+        with self.assertRaises(b.BridgeError):
+            b.Store(self.path)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir() if '.bak' in p.name), [])
+
+    def test_real_sqlite_full_rolls_back_the_whole_batch_and_cursor(self):
+        store = self.open()
+        pages = store.db.execute('PRAGMA page_count').fetchone()[0]
+        store.db.execute(f'PRAGMA max_page_count={pages + 2}')
+        events = self.batch(count=40, size=2000)
+        with self.assertRaises(sqlite3.OperationalError) as caught:
+            store.accept('tg', events, 99, '-100', '99')
+        self.assertIn('full', str(caught.exception))
+        self.assertNotIsInstance(caught.exception, b.BridgeError)
+        store.db.close()
+        self.assert_nothing_acknowledged()
+        self.assert_batch_once(self.open(), events)
+
+    def test_real_sqlite_full_rolls_back_a_max_batch_too(self):
+        store = self.open()
+        events = [mx(f'm{i}', 'y' * 3000) for i in range(40)] + [mx('bad', text=[])]
+        store.db.execute(f"PRAGMA max_page_count={store.db.execute('PRAGMA page_count').fetchone()[0] + 2}")
+        with self.assertRaises(sqlite3.OperationalError):
+            store.accept('max', events, 'marker-2', '-200', '88')
+        store.db.close()
+        store = self.open()
+        self.assertEqual((store.get('cursor_max'), store.db.execute('SELECT count(*) FROM jobs').fetchone()[0]), (None, 0))
+        store.accept('max', events, 'marker-2', '-200', '88')
+        store.accept('max', events, 'marker-2', '-200', '88')
+        self.assertEqual(store.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 40)
+        self.assertEqual(store.db.execute('SELECT count(*) FROM quarantine').fetchone()[0], 1)
+        self.assertEqual(store.get('cursor_max'), 'marker-2')
+
+    def test_real_commit_failure_is_not_acknowledged_and_batch_is_kept_once(self):
+        self.open().db.close()
+        events = self.batch(count=40, size=3000)
+        # A child process gets a file size limit: statements fit in the page cache, so the
+        # first write happens in COMMIT (WAL frames) and fails there with a real I/O error.
+        script = """
+import importlib.util, json, resource, signal, sqlite3, sys
+spec = importlib.util.spec_from_file_location('bridge', sys.argv[1])
+b = importlib.util.module_from_spec(spec); spec.loader.exec_module(b)
+store = b.Store(sys.argv[2])
+store.db.execute('PRAGMA cache_size=-65536')
+real_set = b.Store.set
+def set_(self, key, value):
+    real_set(self, key, value)
+    if key == 'cursor_tg':
+        print('before-commit', flush=True)
+b.Store.set = set_
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+limit = 64 * 1024
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+try:
+    store.accept('tg', json.loads(sys.stdin.read()), 99, '-100', '99')
+except sqlite3.Error as exc:
+    print('commit-error', type(exc).__name__, flush=True)
+"""
+        for name in ('bridge.sqlite3', 'bridge.sqlite3-wal'):
+            if (self.path.parent / name).exists():
+                self.assertLess((self.path.parent / name).stat().st_size, 64 * 1024)
+        result = subprocess.run([sys.executable, '-c', script, str(Path(b.__file__)), str(self.path)],
+                                input=json.dumps(events), capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.stdout.split(), ['before-commit', 'commit-error', 'OperationalError'], result)
+        self.assert_nothing_acknowledged()
+        self.assert_batch_once(self.open(), events)
+
+    def test_foreign_binding_is_rejected_before_the_queue_is_touched(self):
+        store = self.open()
+        store.accept('tg', [tg()], 2, '-100', '99')
+        with store.db:
+            store.set('identity', json.dumps(['1', '2', '-100', '-200']))
+            store.db.execute("UPDATE jobs SET state='sending'")
+        store.db.close()
+
+        class NoApi:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                pass
+
+        with patch.object(b, 'config', return_value={'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}), \
+                patch.object(b, 'Api', return_value=NoApi()), \
+                patch.object(b, 'doctor', AsyncMock(return_value={'tg': '99', 'max': '88'})), \
+                patch.object(b, 'run_bridge', AsyncMock()) as run:
+            with self.assertRaisesRegex(b.BridgeError, 'другой паре'):
+                asyncio.run(b.network_command(SimpleNamespace(command='run'), self.path.parent, self.path))
+        run.assert_not_awaited()
+        conn = sqlite3.connect(self.path)
+        try:
+            # recover() did not run: the foreign database is left exactly as it was.
+            self.assertEqual(conn.execute('SELECT state FROM jobs').fetchone()[0], 'sending')
+            self.assertEqual(json.loads(conn.execute("SELECT value FROM meta WHERE key='identity'").fetchone()[0])[0], '1')
+        finally:
+            conn.close()
+
+    def test_stand_snapshot_ignores_sidecar_files_but_detects_data_changes(self):
+        spec = importlib.util.spec_from_file_location('stand_ctl', Path(__file__).parent / 'stand' / 'stand_ctl.py')
+        ctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ctl)
+        store = self.open()
+        store.accept('tg', [tg()], 2, '-100', '99')
+        store.db.close()
+        before = ctl.logical_snapshot(self.path)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(b.main(['status', '--json', '--state-dir', str(self.path.parent)]), 0)
+        self.assertEqual(json.loads(output.getvalue())['schema_version'], b.SCHEMA_VERSION)
+        self.assertEqual(ctl.logical_snapshot(self.path), before)
+        reader = sqlite3.connect(self.path)
+        try:
+            reader.execute('SELECT count(*) FROM jobs').fetchone()
+            self.assertTrue(Path(str(self.path) + '-wal').exists() and Path(str(self.path) + '-shm').exists())
+            self.assertEqual(ctl.logical_snapshot(self.path), before)
+        finally:
+            reader.close()
+        for change in ("UPDATE meta SET value='3' WHERE key='cursor_tg'", "UPDATE jobs SET state='sent'",
+                       'PRAGMA user_version=2'):
+            conn = sqlite3.connect(self.path)
+            try:
+                conn.execute(change)
+                conn.commit()
+            finally:
+                conn.close()
+            after = ctl.logical_snapshot(self.path)
+            self.assertNotEqual(after, before, change)
+            before = after
+
+    def test_recover_is_idempotent_and_keeps_every_state(self):
+        store = self.open()
+        store.accept('tg', [tg(i) for i in range(1, 7)], 7, '-100', '99')
+        store.accept('max', [mx('m1')], 'mk', '-200', '88')
+        with store.db:
+            store.db.execute("UPDATE jobs SET state='sent',remote_id='r1' WHERE id=1")
+            store.db.execute("UPDATE jobs SET state='failed' WHERE id=2")
+            store.db.execute("UPDATE jobs SET state='uncertain' WHERE id=3")
+            store.db.execute("UPDATE jobs SET state='skipped' WHERE id=4")
+            store.db.execute("UPDATE jobs SET state='sending' WHERE id=5")
+            store.db.execute("UPDATE jobs SET ready=12345.5 WHERE id=6")
+            store.audit('job', 2, 'retry', 'failed', 'failed', 'test')
+        store.db.close()
+        for _ in range(2):
+            store = self.open()
+            store.recover()
+            rows = store.db.execute('SELECT id,state,remote_id,ready FROM jobs ORDER BY id').fetchall()
+            self.assertEqual([tuple(r)[:3] for r in rows],
+                             [(1, 'sent', 'r1'), (2, 'failed', None), (3, 'uncertain', None), (4, 'skipped', None),
+                              (5, 'uncertain', None), (6, 'pending', None), (7, 'pending', None)])
+            self.assertEqual(rows[5]['ready'], 12345.5)
+            self.assertEqual((store.get('cursor_tg'), store.get('cursor_max')), ('7', 'mk'))
+            self.assertEqual(store.db.execute('SELECT count(*) FROM audit').fetchone()[0], 1)
+            store.db.close()
 
 
 if __name__ == '__main__':
