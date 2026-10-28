@@ -7,3 +7,4 @@
 *.log
 02-messenger-sync/demo-video/stills/
 02-messenger-sync/demo-video/*.mp4
+compose.override.yaml
