@@ -12,8 +12,10 @@ case "$PROJECT" in
 esac
 # The stand removes its project with down -v, so it must only ever see resources it created itself.
 for kind in 'ps -aq' 'volume ls -q'; do
-    all=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT" | wc -l)
-    own=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT" --filter label=telegram-max-bridge.stand=1 | wc -l)
+    all=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT") \
+        || refuse "cannot list docker resources of '$PROJECT'"
+    own=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT" --filter label=telegram-max-bridge.stand=1) \
+        || refuse "cannot list docker resources of '$PROJECT'"
     [ "$all" = "$own" ] || refuse "project '$PROJECT' has resources not created by the stand"
 done
 export BRIDGE_IMAGE=${STAND_IMAGE:-telegram-max-bridge:stand}

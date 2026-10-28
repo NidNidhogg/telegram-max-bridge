@@ -62,7 +62,7 @@ stop-bridge:
 	$(COMPOSE) stop bridge
 
 cli:
-	@test -n "$(ARGS)" || { echo "Укажите команду: make cli ARGS='queue list'" >&2; exit 2; }
+	$(if $(strip $(ARGS)),,$(error Укажите команду: make cli ARGS='queue list'))
 	$(COMPOSE) run --rm --no-deps -T bridge $(ARGS)
 
 test: build
