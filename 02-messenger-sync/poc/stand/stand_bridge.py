@@ -73,6 +73,5 @@ if MARKER:
 if __name__ == '__main__':
     try:
         sys.exit(b.main() or 0)
-    except (b.BridgeError, FileNotFoundError) as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(b.report_failure(exc))

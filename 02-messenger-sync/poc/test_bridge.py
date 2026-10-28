@@ -347,6 +347,74 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.store.set('last_poll_success_' + platform, now)
                 self.store.set('last_poll_error_' + platform, '')
 
+    def telemetry(self, workers, run_id='run-now', now=1000):
+        self.healthy_telemetry(now)
+        with self.store.db:
+            self.store.set('run_id', run_id)
+            self.store.set('workers', json.dumps({'run_id': run_id, 'workers': workers}))
+
+    def codes(self, snapshot):
+        return {(i['code'], i.get('worker') or i.get('platform')) for i in snapshot['issues']}
+
+    async def test_worker_telemetry_reports_stall_and_pause_but_not_planned_waits(self):
+        ok = {'phase': 'wait', 'since': 990, 'until': 1001, 'reason': None}
+        stalled = {'phase': 'deliver', 'since': 500, 'until': 600, 'reason': None}
+        self.telemetry({'poll:tg': ok, 'send:tg': ok, 'send:max': stalled,
+                        'poll:max': {'phase': 'paused', 'since': 900, 'until': None, 'reason': 'auth_rejected'}})
+        snapshot = b.health_snapshot(self.store, now=1000, running=True, stale_after=180)
+        codes = self.codes(snapshot)
+        self.assertTrue({('platform_paused', 'max'), ('worker_stalled', 'send:max')} <= codes, codes)
+        self.assertFalse({('worker_stalled', 'poll:tg'), ('worker_stalled', 'send:tg')} & codes)
+        self.assertEqual(next(i for i in snapshot['issues'] if i['code'] == 'platform_paused')['reason'], 'auth_rejected')
+        stall = next(i for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+        self.assertEqual((stall['platform'], stall['phase']), ('max', 'deliver'))
+        # A planned wait longer than a day (server Retry-After) is not a stall.
+        self.telemetry({'poll:tg': {'phase': 'wait', 'since': 990, 'until': 1000 + 2 * 86400, 'reason': None}})
+        self.assertNotIn('worker_stalled', {c for c, _ in self.codes(b.health_snapshot(self.store, now=1000, running=True))})
+        # Telemetry of a previous run or of a stopped process never describes current workers.
+        self.telemetry({'send:max': stalled}, run_id='old-run')
+        with self.store.db:
+            self.store.set('run_id', 'new-run')
+        snapshot = b.health_snapshot(self.store, now=1000, running=True)
+        self.assertEqual((snapshot['workers'], 'worker_stalled' in {c for c, _ in self.codes(snapshot)}), ({}, False))
+        self.telemetry({'send:max': stalled})
+        self.assertEqual(b.health_snapshot(self.store, now=1000, running=False)['workers'], {})
+
+    async def test_waiting_head_shows_reason_and_full_retry_after_after_reopen(self):
+        self.store.accept('tg', [tg(text='PRIVATE_MESSAGE')], 2, '-100', '99')
+        self.store.update(1, 'pending', b.error_text('rate_limited', 429, 'max: API error 429'), delay=2 * 86400)
+        self.store.db.close()
+        self.store = b.Store(Path(self.tmp.name) / 'state.db')
+        now = time.time()
+        self.healthy_telemetry(now)
+        snapshot = b.health_snapshot(self.store, now=now, running=True)
+        head = snapshot['platforms']['max']['delivery']['head']
+        self.assertEqual((head['id'], head['state'], head['reason'], head['wait']), (1, 'pending', 'rate_limited', 'retry'))
+        self.assertGreater(head['retry_at'], now + 2 * 86400 - 60)
+        self.assertGreater(head['wait_seconds'], 2 * 86400 - 60)
+        self.assertNotIn('PRIVATE', json.dumps(snapshot))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            b.print_health(snapshot)
+        self.assertIn('reason=rate_limited wait=retry', output.getvalue())
+
+    async def test_monitor_ignores_age_and_attempt_changes_of_one_problem(self):
+        monitor = b.AlertMonitor(':memory:')
+        try:
+            self.store.accept('tg', [tg()], 2, '-100', '99')
+            self.store.update(1, 'failed', b.error_text('api_rejected', 400, 'max: API error 400'))
+            emitted = []
+            for now in (1000, 1500, 9000):
+                self.healthy_telemetry(now)
+                with self.store.db:
+                    self.store.db.execute('UPDATE jobs SET attempts=attempts+1')
+                monitor.observe(b.health_snapshot(self.store, now=now, running=True, queue_age=10 ** 9))
+                monitor.flush(emitted.append)
+            self.assertEqual([(a['kind'], a['issue']['code']) for a in emitted], [('problem', 'delivery_blocked')])
+            self.assertEqual(emitted[0]['issue']['reason'], 'api_rejected')
+        finally:
+            monitor.db.close()
+
     async def test_empty_queue_is_healthy_after_successful_empty_polls(self):
         self.healthy_telemetry()
         snapshot = b.health_snapshot(self.store, now=1000, running=True)
@@ -443,11 +511,18 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             monitor.observe(repeated)
             self.assertEqual(monitor.flush(emitted.append), 0)
             self.healthy_telemetry()
+            # Recovery is confirmed by a second clean observation, also across a monitor restart.
             monitor.observe(b.health_snapshot(self.store, now=1000, running=True))
-            self.assertEqual(monitor.flush(emitted.append), 1)
+            self.assertEqual(monitor.flush(emitted.append), 0)
+            monitor.db.close()
+            monitor = b.AlertMonitor(monitor_path)
             monitor.observe(b.health_snapshot(self.store, now=1001, running=True))
+            self.assertEqual(monitor.flush(emitted.append), 1)
+            monitor.observe(b.health_snapshot(self.store, now=1002, running=True))
             self.assertEqual(monitor.flush(emitted.append), 0)
             self.assertEqual([a['kind'] for a in emitted], ['problem', 'recovery'])
+            self.assertEqual({a['event'] for a in emitted}, {'alert_problem', 'alert_recovery'})
+            self.assertTrue(all(a['component'] == 'monitor' and a['timestamp'].endswith('Z') for a in emitted))
             self.assertNotIn('PRIVATE', json.dumps(emitted))
         finally:
             monitor.db.close()
@@ -482,6 +557,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([a['kind'] for a in emitted], ['problem', 'problem'])
             self.healthy_telemetry()
             monitor.observe(b.health_snapshot(self.store, now=1002, running=True))
+            monitor.observe(b.health_snapshot(self.store, now=1003, running=True))
             monitor.flush(emitted.append)
             self.assertEqual([a['kind'] for a in emitted], ['problem', 'problem', 'recovery', 'recovery'])
         finally:

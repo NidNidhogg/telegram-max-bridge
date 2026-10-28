@@ -39,6 +39,16 @@ SEND_BACKOFF = (2, 120)
 BACKOFF_JITTER = 0.2
 # A prepared MAX attachment is reused for this long after attachment.not.ready / 429.
 ATTACHMENT_REUSE = 600
+# Operation budgets: a worker phase that runs this long past its deadline is reported as stalled.
+LOG_FIELDS = ('platform', 'direction', 'worker', 'job_id', 'part', 'state', 'phase', 'attempt', 'http_status',
+              'error_code', 'retry_at', 'delay_seconds', 'duration_ms', 'count', 'kind', 'issue_code', 'event_id')
+SAFE_VALUE = re.compile(r'[A-Za-z0-9_.:>-]{1,64}')
+RUN = {'id': None, 'component': None}
+ERROR_CODES = frozenset({'tls_failed', 'attachment_not_ready', 'server_error', 'rate_limited', 'auth_rejected',
+                         'poll_conflict', 'api_rejected', 'connect_failed', 'transport_error', 'bridge_error',
+                         'storage_error', 'internal_error', 'cancelled', 'bad_response', 'interrupted'})
+WORKERS = ('poll:tg', 'poll:max', 'send:tg', 'send:max')
+RECOVERY_CONFIRMATIONS = 2
 MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
                  'vkuserphoto.ru', 'vk-cdn.net')
 
@@ -102,6 +112,59 @@ def backoff(failures, base, cap, rand=random.random):
     """Positive bounded exponential delay with bounded jitter: [d, d*(1+BACKOFF_JITTER)]."""
     delay = min(cap, base * 2 ** min(max(failures, 1) - 1, 30))
     return delay * (1 + BACKOFF_JITTER * min(max(rand(), 0.0), 1.0))
+
+
+def utc(moment):
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(moment)) + f'.{int(moment % 1 * 1000):03d}Z'
+
+
+def log(level, event, message=None, stream=None, **fields):
+    """One JSON line per event; only allow-listed fields with safe scalar values (no text, URLs, bodies)."""
+    record = {'timestamp': utc(time.time()), 'level': level, 'component': RUN['component'] or 'bridge', 'event': event, 'run_id': RUN['id']}
+    for key in LOG_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, float) and math.isfinite(value):
+            record[key] = round(value, 3)
+        elif isinstance(value, int) or (isinstance(value, str) and SAFE_VALUE.fullmatch(value)):
+            record[key] = value
+    if message is not None:
+        record['message'] = message
+    print(json.dumps(record, ensure_ascii=False), file=stream or sys.stdout, flush=True)
+
+
+def error_info(exc):
+    """Safe classification of an error: (code from a fixed vocabulary, HTTP status or None)."""
+    if isinstance(exc, CertificateError):
+        return 'tls_failed', None
+    if isinstance(exc, ApiError):
+        status = exc.status if isinstance(exc.status, int) and not isinstance(exc.status, bool) else None
+        code = exc.code
+        if code == 'attachment.not.ready':
+            return 'attachment_not_ready', status
+        if any(str(c).isdigit() and int(c) >= 500 for c in (code, status or 0)):
+            return 'server_error', status
+        return {'429': 'rate_limited', '401': 'auth_rejected', '403': 'auth_rejected',
+                '409': 'poll_conflict'}.get(code, 'api_rejected'), status
+    if isinstance(exc, ConnectError):
+        return 'connect_failed', None
+    if isinstance(exc, TransportError):
+        return 'transport_error', None
+    if isinstance(exc, BridgeError):
+        return 'bridge_error', None
+    if isinstance(exc, sqlite3.Error):
+        return 'storage_error', None
+    return 'internal_error', None
+
+
+def error_text(code, status, message):
+    return f"{code}{f' http={status}' if status else ''}: {message}"
+
+
+def error_code(text):
+    code = (text or '').split(':', 1)[0].split(' ', 1)[0]
+    return code if code in ERROR_CODES else None
 
 
 class EventError(BridgeError):
@@ -722,21 +785,26 @@ class Store:
 
     def recover(self):
         with self.db:
-            self.db.execute("UPDATE jobs SET state='uncertain',error='Процесс остановился при отправке',updated=? WHERE state='sending'", (time.time(),))
+            self.db.execute("UPDATE jobs SET state='uncertain',error='interrupted: Процесс остановился при отправке',updated=? WHERE state='sending'", (time.time(),))
 
-    def runtime(self, state):
+    def runtime(self, state, run_id=None):
         with self.db:
             now = time.time()
             self.set('runtime_state', state)
             self.set('heartbeat', now)
             if state == 'running':
                 self.set('run_started', now)
+                self.set('run_id', run_id or '')
+                # Telemetry of a previous run never describes the workers of this one.
+                self.set('workers', json.dumps({'run_id': run_id, 'workers': {}}))
             else:
                 self.set('run_stopped', now)
 
-    def heartbeat(self):
+    def heartbeat(self, workers=None):
         with self.db:
             self.set('heartbeat', time.time())
+            if workers is not None:
+                self.set('workers', json.dumps({'run_id': self.get('run_id'), 'workers': workers}))
 
     def poll_failure(self, platform, error):
         with self.db:
@@ -772,6 +840,14 @@ class Bridge:
         self.random = random.random
         self.prepared = {}
         self.send_intervals = {'tg': 3.2, 'max': 0.6} if send_intervals is None else send_intervals
+        # In-memory progress of each poller/sender; the heartbeat persists it, it never advances it.
+        self.workers = {}
+        total = getattr(getattr(api, 'timeout', None), 'total', None) or 25
+        self.budgets = {'poll': total + 5, 'deliver': 5 * total + 5}
+
+    def phase(self, worker, phase, until=None, reason=None):
+        now = time.time()
+        self.workers[worker] = {'phase': phase, 'since': now, 'until': until, 'reason': reason}
 
     async def poll(self, platform):
         try:
@@ -787,7 +863,7 @@ class Bridge:
                 events, next_cursor = result.get('updates', []), result.get('marker')
             self.store.accept(platform, events, next_cursor, self.cfg[platform.upper() + '_CHAT_ID'], self.ids[platform])
         except BridgeError as exc:
-            self.store.poll_failure(platform, exc)
+            self.store.poll_failure(platform, error_text(*error_info(exc), 'опрос не выполнен'))
             raise
 
     async def deliver(self, destination, stop=None):
@@ -805,8 +881,25 @@ class Bridge:
         target = self.cfg[destination.upper() + '_CHAT_ID']
         parent = self.store.parent_id(job) if job['part'] == 0 else None
         publishing = False
+        started = time.monotonic()
         cached = self.prepared.pop(job['id'], None)
         expires, photo = cached if cached and cached[0] > time.monotonic() else (0, None)
+
+        def finish(state, exc, delay=0, code=None, message=None):
+            status = None
+            if code is None:
+                code, status = error_info(exc)
+            self.store.update(job['id'], state, error_text(code, status, message or str(exc)), delay=delay,
+                              counted=publishing)
+            level, event = {'pending': ('warning', 'delivery_retry_scheduled'), 'failed': ('error', 'delivery_failed'),
+                            'uncertain': ('error', 'delivery_uncertain')}[state]
+            log(level, event, platform=destination, direction=f"{job['source']}>{destination}", job_id=job['id'],
+                part=job['part'], state=state, phase='publish' if publishing else 'prepare',
+                attempt=job['attempts'] + 1, error_code=code, http_status=status,
+                retry_at=time.time() + delay if state == 'pending' else None,
+                delay_seconds=delay if state == 'pending' else None,
+                duration_ms=int((time.monotonic() - started) * 1000))
+
         try:
             if part['kind'] == 'photo' and photo is None:
                 photo = await self.api.prepare_photo(job['source'], part['reference'], destination)
@@ -826,10 +919,12 @@ class Bridge:
                 raise TransportError('API не вернул корректный ID опубликованного сообщения')
             remote_id = str(remote_id)
             self.store.update(job['id'], 'sent', remote_id=remote_id, counted=True)
-            print(f"sent job={job['id']} {job['source']}->{destination}", flush=True)
+            log('info', 'delivery_sent', platform=destination, direction=f"{job['source']}>{destination}",
+                job_id=job['id'], part=job['part'], state='sent', phase='publish', attempt=job['attempts'] + 1,
+                duration_ms=int((time.monotonic() - started) * 1000))
         except asyncio.CancelledError:
             if publishing:
-                self.store.update(job['id'], 'uncertain', 'Отмена во время публикации; требуется сверка', counted=True)
+                finish('uncertain', None, code='cancelled', message='Отмена во время публикации; требуется сверка')
             raise
         except ApiError as exc:
             # A definitive rejection is safe to retry. A server 5xx may be post-publication.
@@ -837,33 +932,28 @@ class Bridge:
             server_error = any(str(c).isdigit() and int(c) >= 500 for c in (exc.code, exc.status or 0))
             if publishing and server_error:
                 # HTTP 5xx after the request may have published wins over a retryable body code.
-                state, delay = 'uncertain', 0
+                finish('uncertain', exc)
             elif exc.code in ('429', 'attachment.not.ready') or server_error:
-                state, delay = 'pending', retry
                 if publishing and isinstance(photo, dict):
                     # Reuse the uploaded MAX attachment instead of uploading again.
                     self.prepared[job['id']] = (expires, photo)
+                finish('pending', exc, retry)
             else:
-                state, delay = 'failed', 0
-            self.store.update(job['id'], state, str(exc), delay=delay, counted=publishing)
-            print(f"{state} job={job['id']} {exc}", flush=True)
+                finish('failed', exc)
         except TransportError as exc:
             # ConnectError proves the request was not sent, even during publication.
-            state = 'uncertain' if publishing and not isinstance(exc, ConnectError) else 'pending'
-            self.store.update(job['id'], state, str(exc), delay=self.backoff(job) if state == 'pending' else 0,
-                              counted=publishing)
-            print(f"{state} job={job['id']} {exc}", flush=True)
+            if publishing and not isinstance(exc, ConnectError):
+                finish('uncertain', exc)
+            else:
+                finish('pending', exc, self.backoff(job))
         except (KeyError, TypeError, ValueError):
-            state = 'uncertain' if publishing else 'failed'
-            self.store.update(job['id'], state, 'Неожиданный формат ответа API', counted=publishing)
-            print(f"{state} job={job['id']} unexpected-response", flush=True)
+            finish('uncertain' if publishing else 'failed', None, code='bad_response',
+                   message='Неожиданный формат ответа API')
         except BridgeError as exc:
-            self.store.update(job['id'], 'failed', str(exc), counted=publishing)
-            print(f"failed job={job['id']} {exc}", flush=True)
+            finish('failed', exc)
         finally:
             with self.store.db:
                 self.store.set('next_' + destination, time.time() + self.send_intervals[destination])
-
 
     def backoff(self, job):
         # attempts counts each preparation or publication attempt of this queue head once.
@@ -890,38 +980,54 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                 await stop.wait()
                 return
             delay = poll_interval
+            worker = 'poll:' + platform
+            bridge.phase(worker, 'poll', time.time() + bridge.budgets['poll'])
             try:
                 await bridge.poll(platform)
+                if failures:
+                    log('info', 'poll_recovered', platform=platform, worker=worker, count=failures)
                 failures = 0
             except BridgeError as exc:
                 failures += 1
+                code, status = error_info(exc)
                 if isinstance(exc, ApiError) and exc.code == '409':
+                    log('error', 'poll_conflict', platform=platform, worker=worker, error_code=code, http_status=status)
                     raise BridgeError(f'{platform}: конфликт другого poller; мост остановлен') from None
-                if failures == 1 or failures % 30 == 0:
-                    print(f'poll {platform}: {exc}', flush=True)
                 delay = backoff(failures, *POLL_BACKOFF, rand=bridge.random)
                 if isinstance(exc, ApiError):
                     delay = max(delay, exc.retry_after)
                 if (isinstance(exc, ApiError) and exc.code in ('401', '403')) or isinstance(exc, CertificateError):
                     bridge.paused.add(platform)
-                    print(f'{platform}: приём/отправка приостановлены; проверьте права/сертификат и перезапустите мост', flush=True)
+                    bridge.phase(worker, 'paused', reason=code)
+                    log('error', 'platform_paused', platform=platform, worker=worker, error_code=code,
+                        http_status=status, message='Приём/отправка приостановлены; проверьте права/сертификат и перезапустите мост')
+                    continue
+                if failures == 1 or failures % 30 == 0:
+                    log('warning', 'poll_failed', platform=platform, worker=worker, attempt=failures, error_code=code,
+                        http_status=status, delay_seconds=delay, retry_at=time.time() + delay)
+            bridge.phase(worker, 'wait', time.time() + delay)
             await wait(delay)
 
     async def sender(platform):
+        worker = 'send:' + platform
         while not stop.is_set():
+            bridge.phase(worker, 'deliver', time.time() + bridge.budgets['deliver'])
             await bridge.deliver(platform, stop)
+            bridge.phase(worker, 'wait', time.time() + delivery_interval)
             await wait(delivery_interval)
 
     async def heartbeat():
         while not stop.is_set():
-            bridge.store.heartbeat()
+            bridge.store.heartbeat(bridge.workers)
             await wait(heartbeat_interval)
 
     if install_signals:
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(signum, stop.set)
+    RUN['id'] = secrets.token_hex(8)
     try:
-        bridge.store.runtime('running')
+        bridge.store.runtime('running', RUN['id'])
+        log('info', 'bridge_started')
         try:
             async with asyncio.TaskGroup() as group:
                 workers = [group.create_task(poller(p), name='poll:' + p) for p in ('tg', 'max')]
@@ -940,7 +1046,7 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
         if install_signals:
             for signum in (signal.SIGTERM, signal.SIGINT):
                 loop.remove_signal_handler(signum)
-        bridge.store.runtime('stopped')
+        bridge.store.runtime('stopped', RUN['id'])
 
 
 async def doctor(cfg, api, chats=False):
@@ -951,12 +1057,14 @@ async def doctor(cfg, api, chats=False):
         expected = cfg.get(platform.upper() + '_BOT_USERNAME', '').lstrip('@').lower()
         if expected and (bot.get('username') or '').lower() != expected:
             raise BridgeError(f'{platform}: токен относится к другому боту; проверьте ожидаемый username')
-        print(f"{platform}: bot @{bot.get('username', '')}, id={ids[platform]}")
+        if RUN['component'] is None:
+            print(f"{platform}: bot @{bot.get('username', '')}, id={ids[platform]}")
     webhook = await api.request('tg', 'getWebhookInfo')
     subscriptions = (await api.request('max', '/subscriptions')).get('subscriptions', [])
     if webhook.get('url') or subscriptions:
         raise BridgeError('У бота есть webhook-подписка. Нужна проверка перед переходом на тестовый polling; автоматически не отключаю.')
-    print('Webhook-подписок нет; тестовый polling доступен.')
+    if RUN['component'] is None:
+        print('Webhook-подписок нет; тестовый polling доступен.')
     if chats:
         tg_chat = await api.request('tg', 'getChat', query={'chat_id': cfg['TG_CHAT_ID']})
         mx_chat = await api.request('max', '/chats/' + cfg['MAX_CHAT_ID'])
@@ -976,7 +1084,10 @@ async def doctor(cfg, api, chats=False):
         # https://dev.max.ru/docs-api/objects/ChatMember
         if not mx_member.get('is_admin') or 'read_all_messages' not in (mx_member.get('permissions') or []):
             raise BridgeError('MAX: нужны роль администратора и право read_all_messages')
-        print(f"Чаты проверены: Telegram {cfg['TG_CHAT_ID']}; MAX {cfg['MAX_CHAT_ID']}")
+        if RUN['component'] is None:
+            print(f"Чаты проверены: Telegram {cfg['TG_CHAT_ID']}; MAX {cfg['MAX_CHAT_ID']}")
+    if RUN['component'] is not None:
+        log('info', 'preflight_ok')
     return ids
 
 
@@ -1083,11 +1194,36 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
     state = store.get('runtime_state') or 'unknown'
     result['runtime'] = {'state': state, 'process_running': running, 'heartbeat_at': heartbeat,
                          'heartbeat_age_seconds': age(heartbeat), 'started_at': started,
-                         'stopped_at': timestamp('run_stopped')}
+                         'stopped_at': timestamp('run_stopped'), 'run_id': store.get('run_id')}
     if not running or state == 'stopped':
         issue('runtime', 'process_stopped')
     elif heartbeat is None or age(heartbeat) > stale_after:
         issue('runtime', 'heartbeat_stale')
+    result['workers'] = {}
+    try:
+        telemetry = json.loads(store.get('workers') or 'null')
+    except ValueError:
+        telemetry = None
+    if (running and state == 'running' and isinstance(telemetry, dict)
+            and telemetry.get('run_id') == result['runtime']['run_id'] and isinstance(telemetry.get('workers'), dict)):
+        for name in WORKERS:
+            entry = telemetry['workers'].get(name)
+            if not isinstance(entry, dict):
+                continue
+            phase = entry.get('phase') if isinstance(entry.get('phase'), str) and SAFE_VALUE.fullmatch(entry['phase']) else 'unknown'
+            reason = entry.get('reason') if entry.get('reason') in ERROR_CODES else None
+            since, until = (v if isinstance(v, (int, float)) and math.isfinite(v) else None
+                            for v in (entry.get('since'), entry.get('until')))
+            platform = name.split(':')[1]
+            # A phase is stalled only well after its own deadline (operation timeout or planned wake-up).
+            worker_state = ('paused' if phase == 'paused' else
+                            'stalled' if until is not None and now > until + stale_after else 'ok')
+            result['workers'][name] = {'phase': phase, 'state': worker_state, 'since': since, 'until': until,
+                                       'reason': reason}
+            if worker_state == 'stalled':
+                issue('worker:' + name, 'worker_stalled', platform=platform, worker=name, phase=phase)
+            elif worker_state == 'paused':
+                issue('paused:' + platform, 'platform_paused', platform=platform, reason=reason)
     columns = {row['name'] for row in store.db.execute('PRAGMA table_info(jobs)')}
     for platform in ('tg', 'max'):
         success = timestamp('last_poll_success_' + platform)
@@ -1096,14 +1232,24 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
         warming_up = success is None and started is not None and age(started) <= stale_after
         poll_state = 'error' if poll_error else 'starting' if warming_up else 'ok'
         if poll_error:
-            issue('poll:' + platform, 'poll_error', platform=platform)
+            issue('poll:' + platform, 'poll_error', platform=platform,
+                  reason=error_code(store.get('last_poll_error_' + platform)))
         elif not warming_up and (success is None or age(success) > stale_after):
             poll_state = 'stale'
             issue('poll:' + platform, 'poll_stale', platform=platform)
         counts = {row['state']: row['n'] for row in store.db.execute(
             'SELECT state,count(*) AS n FROM jobs WHERE destination=? GROUP BY state', (platform,))}
-        head = store.db.execute('''SELECT id,state,ready FROM jobs WHERE destination=?
+        head = store.db.execute('''SELECT id,part,state,ready,attempts,error FROM jobs WHERE destination=?
             AND state NOT IN ('sent','skipped') ORDER BY id LIMIT 1''', (platform,)).fetchone()
+        head_view = None
+        if head:
+            ready = head['ready'] if isinstance(head['ready'], (int, float)) else None
+            waiting = (head['state'] == 'pending' and ready is not None and ready > now)
+            head_view = {'id': head['id'], 'part': head['part'], 'state': head['state'], 'ready': head['ready'],
+                         'attempts': head['attempts'], 'reason': error_code(head['error']),
+                         'retry_at': ready if waiting else None,
+                         'wait_seconds': ready - now if waiting else None,
+                         'wait': 'retry' if waiting else 'manual' if head['state'] in ('failed', 'uncertain') else None}
         pending_age = unresolved_age = None
         unknown_age = 0
         if 'created' in columns:
@@ -1117,7 +1263,8 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
         else:
             unknown_age = sum(n for key, n in counts.items() if key not in ('sent', 'skipped'))
         if head and head['state'] in ('failed', 'uncertain'):
-            issue('blocked:' + platform, 'delivery_blocked', platform=platform, job_id=head['id'], state=head['state'])
+            issue('blocked:' + platform, 'delivery_blocked', platform=platform, job_id=head['id'], state=head['state'],
+                  reason=head_view['reason'])
         if unresolved_age is not None and unresolved_age > queue_age:
             issue('backlog:' + platform, 'queue_too_old', platform=platform)
         if unknown_age:
@@ -1131,7 +1278,7 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
             'poll': {'state': poll_state, 'last_success_at': success, 'last_failure_at': failure,
                      'success_age_seconds': age(success)},
             'delivery': {'last_success_at': timestamp('last_delivery_success_' + platform),
-                         'counts': counts, 'head': dict(head) if head else None,
+                         'counts': counts, 'head': head_view,
                          'oldest_pending_age_seconds': pending_age,
                          'oldest_unresolved_age_seconds': unresolved_age,
                          'unknown_age_count': unknown_age},
@@ -1166,6 +1313,12 @@ def print_health(snapshot):
         delivery = data['delivery']
         counts = ' '.join(f'{key}={value}' for key, value in sorted(delivery['counts'].items())) or 'empty'
         print(f"{platform}: poll={data['poll']['state']} last_poll={data['poll']['last_success_at']} last_delivery={delivery['last_success_at']} {counts} oldest_pending_age={delivery['oldest_pending_age_seconds']} oldest_unresolved_age={delivery['oldest_unresolved_age_seconds']} quarantine={data['quarantine_open']}")
+    for name, worker in snapshot.get('workers', {}).items():
+        print(f"worker {name}: state={worker['state']} phase={worker['phase']} until={worker['until']} reason={worker['reason']}")
+    for platform, data in snapshot['platforms'].items():
+        head = data['delivery']['head']
+        if head:
+            print(f"{platform}: head job={head['id']} part={head['part']} state={head['state']} reason={head['reason']} wait={head['wait']} retry_at={head['retry_at']}")
     for issue in snapshot['issues']:
         print('issue ' + json.dumps(issue, ensure_ascii=False, sort_keys=True))
 
@@ -1187,18 +1340,35 @@ class AlertMonitor:
         with self.db:
             row = self.db.execute("SELECT value FROM monitor_state WHERE key='issues'").fetchone()
             previous = json.loads(row[0]) if row else {}
+            row = self.db.execute("SELECT value FROM monitor_state WHERE key='absent'").fetchone()
+            absent = json.loads(row[0]) if row else {}
             if not snapshot['platforms']:
                 # An unreadable/missing state is not evidence that known faults recovered.
                 current = {**previous, **current}
+            known = dict(current)
             for key in sorted(set(current) | set(previous)):
-                if current.get(key) == previous.get(key):
+                if key in current:
+                    absent.pop(key, None)
+                    if current[key] != previous.get(key):
+                        self.alert('problem', snapshot['generated_at'], current[key])
                     continue
-                entry = current.get(key) or previous[key]
-                alert = {'event_id': secrets.token_hex(16), 'kind': 'problem' if key in current else 'recovery',
-                         'detected_at': snapshot['generated_at'], 'issue': entry}
-                self.db.execute('INSERT INTO alerts(event_id,payload) VALUES(?,?)',
-                                (alert['event_id'], json.dumps(alert, ensure_ascii=False, sort_keys=True)))
-            self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES('issues',?)", (json.dumps(current, sort_keys=True),))
+                # Recovery needs a confirming observation; until then the problem stays known.
+                absent[key] = absent.get(key, 0) + 1
+                if absent[key] >= RECOVERY_CONFIRMATIONS:
+                    absent.pop(key)
+                    self.alert('recovery', snapshot['generated_at'], previous[key])
+                else:
+                    known[key] = previous[key]
+            self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES('issues',?)", (json.dumps(known, sort_keys=True),))
+            self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES('absent',?)", (json.dumps(absent, sort_keys=True),))
+
+    def alert(self, kind, moment, entry):
+        # alerts.jsonl keeps event_id/kind/detected_at/issue; the log fields are additive.
+        alert = {'event_id': secrets.token_hex(16), 'kind': kind, 'detected_at': moment, 'issue': entry,
+                 'timestamp': utc(moment), 'level': 'error' if kind == 'problem' else 'info',
+                 'component': 'monitor', 'event': 'alert_' + kind, 'run_id': RUN['id']}
+        self.db.execute('INSERT INTO alerts(event_id,payload) VALUES(?,?)',
+                        (alert['event_id'], json.dumps(alert, ensure_ascii=False, sort_keys=True)))
 
     def flush(self, sink):
         count = 0
@@ -1225,6 +1395,9 @@ def monitor(state, args):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     with process_lock(state, 'monitor.lock'):
         alerts = AlertMonitor(state / 'monitor.sqlite3')
+        RUN['id'] = secrets.token_hex(8)
+        if args.alerts_file is not None:
+            log('info', 'monitor_started')
         stopping = False
 
         def stop(_signum, _frame):
@@ -1320,6 +1493,9 @@ def main(argv=None):
             parser.error('--accept-duplicate-risk разрешён только для queue retry')
     elif args.action is not None or args.id is not None or args.reason or args.remote_id or args.remaining or args.accept_duplicate_risk:
         parser.error('Действия и параметры очереди допустимы только для queue/quarantine')
+    if args.command in ('run', 'monitor'):
+        # Long-running commands write JSON Lines; the other CLI commands keep their human/JSON output.
+        RUN['component'] = 'bridge' if args.command == 'run' else 'monitor'
     state = args.state_dir
     db_path = state / 'bridge.sqlite3'
     if args.command == 'monitor':
@@ -1389,23 +1565,30 @@ async def network_command(args, state, db_path):
                 store.set('identity', identity)
             store.recover()
             bridge = Bridge(cfg, api, store, ids)
-            print('Асинхронный тестовый мост запущен. Остановка: Ctrl+C. Только новые тексты и картинки.', flush=True)
             await run_bridge(bridge)
-            print('Остановлено. Очередь сохранена.', flush=True)
+            log('info', 'bridge_stopped', message='Остановлено. Очередь сохранена.')
 
+
+
+def report_failure(exc):
+    """Exit message for a failed command: never a traceback, raw response or exception text of foreign code."""
+    if isinstance(exc, (BridgeError, FileNotFoundError)):
+        # BridgeError texts are fixed by this program; FileNotFoundError names only the local path.
+        message = str(exc)
+    elif isinstance(exc, (OSError, sqlite3.Error)):
+        message = 'Ошибка локального хранилища или вывода; проверьте доступ и свободное место'
+    else:
+        message = 'Внутренняя ошибка: мост остановлен, очередь сохранена; требуется проверка версии'
+    if RUN['component'] is None:
+        print(message, file=sys.stderr)
+    else:
+        code = 'storage_error' if isinstance(exc, OSError) else error_info(exc)[0]
+        log('error', 'stopped_with_error', message=message, stream=sys.stderr, error_code=code)
+    return 1
 
 
 if __name__ == '__main__':
     try:
         sys.exit(main() or 0)
-    except (BridgeError, FileNotFoundError) as exc:
-        # FileNotFoundError prints only the missing local path, never response/request URLs.
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
-    except (OSError, sqlite3.Error):
-        print('Ошибка локального хранилища или вывода; проверьте доступ и свободное место', file=sys.stderr)
-        sys.exit(1)
-    except Exception:
-        print('Внутренняя ошибка: мост остановлен, очередь сохранена; требуется проверка версии', file=sys.stderr)
-        sys.exit(1)
-
+    except Exception as exc:  # noqa: BLE001 - reported without details, see report_failure
+        sys.exit(report_failure(exc))

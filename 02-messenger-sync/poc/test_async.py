@@ -835,5 +835,93 @@ class RuntimeTests(HttpServer):
         self.assertNotIn('tg', self.bridge.paused)
 
 
+    def json_lines(self, text):
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        for record in records:
+            self.assertTrue({'timestamp', 'level', 'component', 'event', 'run_id'} <= set(record), record)
+            self.assertTrue(record['timestamp'].endswith('Z') and isinstance(record['run_id'], str), record)
+        return records
+
+    async def test_run_logs_are_safe_json_lines_for_each_outcome(self):
+        events = [tg(1, 'PRIVATE_TEXT_1'), tg(2, 'PRIVATE_TEXT_2')]
+        for event in events:
+            event['message']['from']['first_name'] = 'PRIVATE_AUTHOR'
+        self.store.accept('tg', events, 3, '-100', '99')
+        event = mx('m1')
+        event['message']['body']['text'] = 'PRIVATE_TEXT_3'
+        event['message']['sender']['first_name'] = 'PRIVATE_AUTHOR'
+        self.store.accept('max', [event], 'k1', '-200', '88')
+        replies = iter([web.json_response({'code': '429', 'message': 'PRIVATE_BODY'}, status=429),
+                        None, web.json_response({'code': 'PRIVATE_CODE'}, status=400)])
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return next(replies) or self.normal(request, body)
+            if request.path == '/sendMessage':
+                return web.json_response({'ok': False, 'description': 'PRIVATE_BODY'}, status=500)
+            return self.normal(request, body)
+
+        self.handler = handle
+        output = io.StringIO()
+        with patch.object(b, 'SEND_BACKOFF', (0.01, 0.02)), redirect_stdout(output):
+            stop, task = self.start()
+            await self.until(lambda: [self.state(i) for i in (1, 2, 3)] == ['sent', 'failed', 'uncertain'], 5)
+            stop.set()
+            await task
+        records = self.json_lines(output.getvalue())
+        events = [r['event'] for r in records]
+        for event in ('bridge_started', 'delivery_retry_scheduled', 'delivery_sent', 'delivery_failed',
+                      'delivery_uncertain'):
+            self.assertIn(event, events)
+        retry = next(r for r in records if r['event'] == 'delivery_retry_scheduled')
+        self.assertEqual((retry['error_code'], retry['http_status'], retry['direction'], retry['job_id'], retry['state']),
+                         ('rate_limited', 429, 'tg>max', 1, 'pending'))
+        self.assertTrue(retry['retry_at'] > 0 and retry['delay_seconds'] > 0)
+        uncertain = next(r for r in records if r['event'] == 'delivery_uncertain')
+        self.assertEqual((uncertain['error_code'], uncertain['phase'], uncertain['direction'], uncertain['job_id']),
+                         ('server_error', 'publish', 'max>tg', 3))
+        self.assertEqual(next(r for r in records if r['event'] == 'delivery_failed')['error_code'], 'api_rejected')
+        self.assertEqual(len({r['run_id'] for r in records}), 1)
+        self.assertFalse([e for e in events if e.startswith('poll') or 'heartbeat' in e])
+        for marker in ('PRIVATE', '127.0.0.1'):
+            self.assertNotIn(marker, output.getvalue())
+        error = self.store.db.execute('SELECT error FROM jobs WHERE id=2').fetchone()[0]
+        self.assertTrue(error.startswith('api_rejected http=400') and 'PRIVATE' not in error, error)
+
+    async def test_one_stalled_worker_is_reported_while_heartbeat_and_others_continue(self):
+        release = asyncio.Event()
+        real_poll, real_deliver = self.bridge.poll, self.bridge.deliver
+
+        async def poll(platform):
+            if platform == 'max':
+                await release.wait()
+            return await real_poll(platform)
+
+        async def deliver(destination, stop=None):
+            if destination == 'tg':
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        self.bridge.poll, self.bridge.deliver = poll, deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        self.start()
+
+        def found():
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.5)
+            return snapshot, {(i['code'], i.get('worker')) for i in snapshot['issues']}
+
+        await self.until(lambda: {('worker_stalled', 'poll:max'), ('worker_stalled', 'send:tg')} <= found()[1])
+        snapshot, codes = found()
+        self.assertEqual({w for c, w in codes if c == 'worker_stalled'}, {'poll:max', 'send:tg'})
+        self.assertNotIn('heartbeat_stale', {c for c, _ in codes})
+        stalled = next(i for i in snapshot['issues'] if i.get('worker') == 'poll:max')
+        self.assertEqual((stalled['platform'], stalled['phase']), ('max', 'poll'))
+        self.assertEqual(snapshot['workers']['send:max']['state'], 'ok')
+        polls = self.posts('/getUpdates')
+        await self.until(lambda: self.posts('/getUpdates') > polls + 3)
+        release.set()
+        await self.until(lambda: 'worker_stalled' not in {c for c, _ in found()[1]})
+
+
 if __name__ == '__main__':
     unittest.main()
