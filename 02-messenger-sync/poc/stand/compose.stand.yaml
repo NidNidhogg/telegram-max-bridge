@@ -1,0 +1,78 @@
+# Overrides for the isolated container stand; used only by stand.sh with a separate project name.
+x-stand-label: &stand-label
+  telegram-max-bridge.stand: "1"
+
+x-hardening: &hardening
+  labels: *stand-label
+  image: ${BRIDGE_IMAGE:-telegram-max-bridge:stand}
+  init: true
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - stand
+
+x-synthetic: &synthetic
+  TG_BOT_TOKEN: synthetic-tg-token
+  MAX_BOT_TOKEN: synthetic-max-token
+  TG_BOT_USERNAME: stand_tg_bot
+  MAX_BOT_USERNAME: stand_max_bot
+  TG_CHAT_ID: "-100"
+  MAX_CHAT_ID: "-200"
+  STAND_API_BASE: http://mockapi:8080
+  HEALTH_STALE_AFTER: ${HEALTH_STALE_AFTER}
+  HEALTH_QUEUE_AGE: ${HEALTH_QUEUE_AGE}
+
+services:
+  bridge:
+    labels: *stand-label
+    entrypoint: ["python", "/app/02-messenger-sync/poc/stand/stand_bridge.py"]
+    env_file: !reset []
+    environment: *synthetic
+    networks:
+      - stand
+    depends_on:
+      mockapi:
+        condition: service_healthy
+
+  monitor:
+    labels: *stand-label
+    env_file: !reset []
+    environment: *synthetic
+    command: ["monitor", "--interval", "1", "--alerts-file", "/state/alerts.jsonl",
+              "--stale-after", "${HEALTH_STALE_AFTER}", "--queue-age", "${HEALTH_QUEUE_AGE}"]
+
+  mockapi:
+    <<: *hardening
+    entrypoint: ["python", "/app/02-messenger-sync/poc/stand/mock_api.py"]
+    volumes:
+      - mockdata:/state
+    environment:
+      STAND_MOCK_DATA: /state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/_ctl/state', b'{}')"]
+      interval: 1s
+      retries: 30
+
+  ctl:
+    <<: *hardening
+    profiles: ["stand"]
+    entrypoint: ["python", "/app/02-messenger-sync/poc/stand/stand_ctl.py"]
+    environment: *synthetic
+    volumes:
+      - state:/state
+
+networks:
+  stand:
+    internal: true
+
+volumes:
+  state:
+    labels: *stand-label
+  mockdata:
+    labels: *stand-label

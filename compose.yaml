@@ -1,0 +1,72 @@
+name: telegram-max-bridge
+
+x-bridge: &bridge
+  image: ${BRIDGE_IMAGE:-telegram-max-bridge:local}
+  init: true
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  env_file:
+    - path: 02-messenger-sync/.env
+      required: false
+  volumes:
+    - state:/state
+  restart: unless-stopped
+  stop_signal: SIGTERM
+  # The bridge gives active operations 30 s after SIGTERM; leave headroom before SIGKILL.
+  stop_grace_period: 60s
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  bridge:
+    <<: *bridge
+    build:
+      context: .
+    command: ["run"]
+    healthcheck:
+      test: ["CMD", "python", "/app/02-messenger-sync/poc/bridge.py", "health", "--json",
+             "--stale-after", "${HEALTH_STALE_AFTER:-180}", "--queue-age", "${HEALTH_QUEUE_AGE:-300}"]
+      interval: ${HEALTH_INTERVAL:-30s}
+      timeout: 10s
+      start_period: ${HEALTH_START_PERIOD:-60s}
+      retries: 3
+
+  monitor:
+    <<: *bridge
+    command: ["monitor", "--interval", "30", "--alerts-file", "/state/alerts.jsonl",
+              "--stale-after", "${HEALTH_STALE_AFTER:-180}", "--queue-age", "${HEALTH_QUEUE_AGE:-300}"]
+    network_mode: none
+    depends_on:
+      - bridge
+
+  test:
+    <<: *bridge
+    profiles: ["tools"]
+    restart: "no"
+    env_file: !reset []
+    volumes: !reset []
+    network_mode: none
+    entrypoint: ["python", "-m", "unittest", "discover", "-s", "/app/02-messenger-sync/poc", "-p", "test_*.py"]
+    command: []
+
+  smoke:
+    <<: *bridge
+    profiles: ["tools"]
+    restart: "no"
+    env_file: !reset []
+    volumes: !reset []
+    network_mode: none
+    entrypoint: ["sh", "-ec", "python smoke_p0.py && python smoke_async.py"]
+    command: []
+
+volumes:
+  state:

@@ -103,17 +103,27 @@ def event_key(platform, event):
     return 'sha256:' + hashlib.sha256(raw.encode()).hexdigest()
 
 
-def config(require_chats=False):
+CONFIG_KEYS = ('TG_BOT_TOKEN', 'MAX_BOT_TOKEN', 'TG_BOT_USERNAME', 'MAX_BOT_USERNAME',
+               'MAX_CA_FILE', 'TG_CHAT_ID', 'MAX_CHAT_ID')
+
+
+def config(require_chats=False, environ=None, env_file=None):
+    """Read the local .env, then let process environment variables override it."""
+    environ = os.environ if environ is None else environ
+    env_file = ENV if env_file is None else env_file
     values = {}
-    if ENV.exists():
-        for line in ENV.read_text().splitlines():
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
                 values[key.strip()] = value.strip().strip('\"\'')
+    for key in CONFIG_KEYS:
+        if key in environ:
+            values[key] = environ[key].strip()
     for key in ('TG_BOT_TOKEN', 'MAX_BOT_TOKEN'):
         if not values.get(key):
-            raise BridgeError(f'Заполните {key} в локальном .env')
+            raise BridgeError(f'Не задан {key}: укажите переменную окружения или строку в локальном .env')
     for key in ('TG_CHAT_ID', 'MAX_CHAT_ID'):
         if require_chats and not values.get(key):
             raise BridgeError(f'Не выбран тестовый чат: {key}')
@@ -122,6 +132,10 @@ def config(require_chats=False):
                 values[key] = str(int(values[key]))
             except ValueError:
                 raise BridgeError(f'{key} должен быть целым числом') from None
+    if values.get('MAX_CA_FILE'):
+        ca_path = Path(values['MAX_CA_FILE'])
+        if not (ca_path if ca_path.is_absolute() else ROOT / ca_path).is_file():
+            raise BridgeError('MAX_CA_FILE: файл сертификата не найден')
     return values
 
 
@@ -1173,7 +1187,7 @@ def main(argv=None):
     parser.add_argument('action', nargs='?', choices=['list', 'show', 'retry', 'confirm', 'skip'])
     parser.add_argument('id', nargs='?', type=int)
     parser.add_argument('--seconds', type=int, default=90)
-    parser.add_argument('--state-dir', type=Path, default=STATE)
+    parser.add_argument('--state-dir', type=Path, default=Path(os.environ.get('BRIDGE_STATE_DIR') or STATE))
     parser.add_argument('--limit', type=int, default=100)
     parser.add_argument('--reason')
     parser.add_argument('--remote-id')
