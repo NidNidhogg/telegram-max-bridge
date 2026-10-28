@@ -4,11 +4,22 @@
 # network, its own Compose project, image tag and volumes. Never touches the working project.
 set -eu
 cd "$(dirname "$0")/../../.."
-PROJECT=${STAND_PROJECT:-telegram-max-bridge-stand}
-[ "$PROJECT" != "${WORK_PROJECT:-telegram-max-bridge}" ] || { echo 'STAND_PROJECT must differ from the working project' >&2; exit 2; }
+WORK_PROJECT=${WORK_PROJECT:-telegram-max-bridge}
+PROJECT=${STAND_PROJECT:-$WORK_PROJECT-stand}
+refuse() { echo "stand refused: $*; nothing was stopped or removed" >&2; exit 2; }
+case "$PROJECT" in
+    "$WORK_PROJECT"|telegram-max-bridge) refuse "stand project '$PROJECT' is a working project name" ;;
+esac
+# The stand removes its project with down -v, so it must only ever see resources it created itself.
+for kind in 'ps -aq' 'volume ls -q'; do
+    all=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT" | wc -l)
+    own=$(docker $kind --filter "label=com.docker.compose.project=$PROJECT" --filter label=telegram-max-bridge.stand=1 | wc -l)
+    [ "$all" = "$own" ] || refuse "project '$PROJECT' has resources not created by the stand"
+done
 export BRIDGE_IMAGE=${STAND_IMAGE:-telegram-max-bridge:stand}
 export HEALTH_STALE_AFTER=6 HEALTH_QUEUE_AGE=8 HEALTH_INTERVAL=1s HEALTH_START_PERIOD=5s
 C="docker compose -p $PROJECT -f compose.yaml -f 02-messenger-sync/poc/stand/compose.stand.yaml"
+M="make --no-print-directory PROJECT=$PROJECT"
 BROKEN=$(mktemp)
 
 step() { echo; echo "== $*"; }
@@ -86,8 +97,10 @@ $C start bridge
 set -- $(ctl uncertain-stays)
 health_is unhealthy
 ctl health delivery_blocked
-$C stop bridge
-$C run --rm --no-deps -T bridge queue confirm "$1" --remote-id "$2" --reason 'stand: copy found in target group'
+$M COMPOSE="$C" stop-bridge
+$M COMPOSE="$C" doctor >/dev/null
+echo 'make stop-bridge + make doctor OK against the mock API'
+$M COMPOSE="$C" cli ARGS="queue confirm $1 --remote-id $2 --reason 'stand: copy found in target group'"
 $C start bridge
 health_is healthy
 ctl confirmed
@@ -102,14 +115,17 @@ $C exec -T bridge sh -c 'kill -STOP "$1"' _ "$pid"
 health_is unhealthy
 ctl health heartbeat_stale
 [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = true ]
+if $M COMPOSE="$C" health; then echo 'make health reported ok for a stalled bridge' >&2; exit 1; fi
+$M COMPOSE="$C" status | grep -q heartbeat_stale
+echo 'make health/status OK: same thresholds as the Docker healthcheck'
 $C exec -T bridge sh -c 'kill -CONT "$1"' _ "$pid"
 health_is healthy
 
 step 'state volume survives make down / make up'
 before=$(ctl snapshot)
-make --no-print-directory down PROJECT="$PROJECT" COMPOSE="$C"
+$M COMPOSE="$C" down
 docker volume inspect "${PROJECT}_state" >/dev/null
-make --no-print-directory up PROJECT="$PROJECT" COMPOSE="$C"
+$M COMPOSE="$C" up
 after=$(ctl snapshot)
 [ "$before" = "$after" ] || { echo "state changed: $before -> $after" >&2; exit 1; }
 echo "volume OK: $after"
@@ -117,11 +133,11 @@ ctl reply-after-restart
 
 step 'make update keeps state; failed build does not stop the working version'
 before=$(ctl snapshot)
-make --no-print-directory update PROJECT="$PROJECT" COMPOSE="$C"
+$M COMPOSE="$C" update
 [ "$before" = "$(ctl snapshot)" ]
 old=$(cid)
 printf 'services:\n  bridge:\n    build:\n      dockerfile_inline: |\n        FROM scratch\n        RUN false\n' >"$BROKEN"
-if make --no-print-directory update PROJECT="$PROJECT" COMPOSE="$C -f $BROKEN"; then
+if $M COMPOSE="$C -f $BROKEN" update; then
     echo 'broken update unexpectedly succeeded' >&2; exit 1
 fi
 [ "$old" = "$(cid)" ] && [ "$(docker inspect -f '{{.State.Running}}' "$old")" = true ]

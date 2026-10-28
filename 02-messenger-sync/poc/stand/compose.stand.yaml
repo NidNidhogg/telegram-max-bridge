@@ -1,5 +1,9 @@
 # Overrides for the isolated container stand; used only by stand.sh with a separate project name.
+x-stand-label: &stand-label
+  telegram-max-bridge.stand: "1"
+
 x-hardening: &hardening
+  labels: *stand-label
   image: ${BRIDGE_IMAGE:-telegram-max-bridge:stand}
   init: true
   user: "10001:10001"
@@ -26,6 +30,7 @@ x-synthetic: &synthetic
 
 services:
   bridge:
+    labels: *stand-label
     entrypoint: ["python", "/app/02-messenger-sync/poc/stand/stand_bridge.py"]
     env_file: !reset []
     environment: *synthetic
@@ -36,6 +41,7 @@ services:
         condition: service_healthy
 
   monitor:
+    labels: *stand-label
     env_file: !reset []
     environment: *synthetic
     command: ["monitor", "--interval", "1", "--alerts-file", "/state/alerts.jsonl",
@@ -66,4 +72,7 @@ networks:
     internal: true
 
 volumes:
+  state:
+    labels: *stand-label
   mockdata:
+    labels: *stand-label
