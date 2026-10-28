@@ -1204,7 +1204,9 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
         telemetry = json.loads(store.get('workers') or 'null')
     except ValueError:
         telemetry = None
-    if (running and state == 'running' and isinstance(telemetry, dict)
+    # A stopped event loop is reported once as heartbeat_stale, not as every worker stalling.
+    fresh = heartbeat is not None and age(heartbeat) <= stale_after
+    if (running and state == 'running' and fresh and isinstance(telemetry, dict)
             and telemetry.get('run_id') == result['runtime']['run_id'] and isinstance(telemetry.get('workers'), dict)):
         for name in WORKERS:
             entry = telemetry['workers'].get(name)

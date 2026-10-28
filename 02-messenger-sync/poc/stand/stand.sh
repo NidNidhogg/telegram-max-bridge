@@ -1,6 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2086,SC2016,SC2046  # $C is intentionally word-split; quoted scripts run in the container
-# Isolated container stand for D1–D3: synthetic tokens, mock Telegram/MAX API on an internal
+# Isolated container stand for D1–D4: synthetic tokens, mock Telegram/MAX API on an internal
 # network, its own Compose project, image tag and volumes. Never touches the working project.
 set -eu
 cd "$(dirname "$0")/../../.."
@@ -298,6 +298,26 @@ echo "$out" | grep -q 'Другой процесс использует прот
 [ "$hits" = "$(ctl d3-hits tg:getMe)" ] || { echo 'second bridge contacted the API' >&2; exit 1; }
 echo 'owner lock OK: second instance refused before any API call; lock file was never removed'
 ctl d3-health-only input_quarantine
+
+seq=0
+for worker in poll:tg send:max poll:max send:tg; do
+    step "D4: stalled $worker is detected while the heartbeat and the other workers run"
+    seq=$((seq + 1))
+    arm "worker:$worker"
+    ctl d4-stalled "$worker" "$seq"
+    fresh
+    ctl d4-recovered "$worker"
+done
+
+step 'D4: bridge and monitor logs are JSON Lines without tokens, texts or author names'
+logs=$($C logs --no-log-prefix bridge monitor 2>&1)
+bad=$(printf '%s\n' "$logs" | grep -v '^{' || true)
+[ -z "$bad" ] || { echo "non-JSON log lines: $bad" >&2; exit 1; }
+if printf '%s\n' "$logs" | grep -E 'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia' >&2; then
+    echo 'private data in container logs' >&2; exit 1
+fi
+printf '%s\n' "$logs" | grep -q '"event": "delivery_sent"' || { echo 'no delivery_sent event' >&2; exit 1; }
+echo "logs OK: $(printf '%s\n' "$logs" | wc -l | tr -d ' ') JSON lines, no synthetic tokens, texts, names or URLs"
 
 echo
 echo 'Container stand passed: synthetic data only, no real API calls'

@@ -379,6 +379,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((snapshot['workers'], 'worker_stalled' in {c for c, _ in self.codes(snapshot)}), ({}, False))
         self.telemetry({'send:max': stalled})
         self.assertEqual(b.health_snapshot(self.store, now=1000, running=False)['workers'], {})
+        # A frozen whole process shows heartbeat_stale only.
+        codes = {c for c, _ in self.codes(b.health_snapshot(self.store, now=2000, running=True, stale_after=180))}
+        self.assertIn('heartbeat_stale', codes)
+        self.assertNotIn('worker_stalled', codes)
 
     async def test_waiting_head_shows_reason_and_full_retry_after_after_reopen(self):
         self.store.accept('tg', [tg(text='PRIVATE_MESSAGE')], 2, '-100', '99')
