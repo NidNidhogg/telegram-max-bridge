@@ -159,7 +159,8 @@ async def max_api(request):
             if mock.max_publish == 'drop_after':
                 request.transport.abort()
                 return web.Response()
-            return web.json_response({'code': 'service.unavailable'}, status=503)
+            # Contradictory body: HTTP 503 must still win over the retryable code.
+            return web.json_response({'code': '429'}, status=503)
         if mock.max_publish == '429':
             mock.publish('max', kind, body.get('text'), reply, status='rejected')
             return web.json_response({'code': '429', 'message': 'synthetic rate limit'}, status=429)

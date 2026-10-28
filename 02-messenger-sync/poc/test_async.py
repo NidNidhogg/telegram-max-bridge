@@ -279,6 +279,17 @@ class ResilienceHttpTests(HttpServer):
                     self.assertAlmostEqual(caught.exception.retry_after, expected, delta=2)
 
 
+    async def test_long_numeric_retry_after_keeps_a_definite_429(self):
+        api = await self.api()
+        for service, path, body in (('tg', 'sendMessage', {'ok': False, 'error_code': 429}),
+                                    ('max', '/messages', {'code': 'too.many.requests'})):
+            self.handler = lambda request, _b, body=body: web.json_response(
+                body, status=429, headers={'Retry-After': '9' * 5000})
+            with self.assertRaises(b.ApiError) as caught:
+                await api.request(service, path, method='POST', body={'text': 'synthetic'})
+            self.assertEqual((caught.exception.code, caught.exception.retry_after), ('429', 0))
+
+
 class RuntimeTests(HttpServer):
     async def asyncSetUp(self):
         await super().asyncSetUp()
@@ -752,6 +763,76 @@ class RuntimeTests(HttpServer):
         self.assertIn(b'"message_id": 75', payload)
         self.assertIn(b'\x89PNG\r\n\x1a\nsynthetic', payload)
         self.assertIn(b'synthetic', payload)
+
+
+    def posts(self, path):
+        return sum(1 for c in self.calls if c[1] == path)
+
+    async def test_http_503_with_retryable_body_after_publication_is_uncertain_once(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return web.json_response({'code': '429'}, status=503, headers={'Retry-After': '1'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        await self.bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+        with self.store.db:
+            self.store.db.execute('UPDATE jobs SET ready=0')
+        restarted = b.Store(Path(self.tmp.name) / 'bridge.sqlite3')
+        self.addCleanup(restarted.db.close)
+        bridge = b.Bridge({'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}, self.client, restarted,
+                          {'tg': '99', 'max': '88'}, send_intervals={'tg': 0, 'max': 0})
+        await bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+
+    async def test_photo_download_429_and_404_through_deliver_both_directions(self):
+        event = tg(1)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 2, '-100', '99')
+        event = mx('2')
+        event['message']['body']['attachments'] = [{'type': 'image', 'payload': {'url': self.url + '/image'}}]
+        self.store.accept('max', [event], 2, '-200', '88')
+        self.client.tg_file_base = self.url + '/files'
+        media = {'status': 429}
+
+        def handle(request, body):
+            if request.path == '/getFile':
+                return web.json_response({'ok': True, 'result': {'file_path': 'image.jpg'}})
+            if request.path in ('/files/image.jpg', '/image'):
+                return web.Response(status=media['status'], headers={'Retry-After': '60'}, text='synthetic')
+            return self.normal(request, body)
+
+        self.handler = handle
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media):
+            for destination, jid in (('max', 1), ('tg', 2)):
+                media['status'] = 429
+                before = time.time()
+                await self.bridge.deliver(destination)
+                job = self.store.db.execute('SELECT state, ready FROM jobs WHERE id=?', (jid,)).fetchone()
+                self.assertEqual(job[0], 'pending', destination)
+                self.assertGreaterEqual(job[1], before + 60, destination)
+                with self.store.db:
+                    self.store.db.execute('UPDATE jobs SET ready=0')
+                media['status'] = 404
+                await self.bridge.deliver(destination)
+                self.assertEqual(self.state(jid), 'failed', destination)
+        self.assertEqual(self.posts('/messages') + self.posts('/sendPhoto'), 0)
+
+    async def test_long_retry_after_on_poll_does_not_stop_the_runtime(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': False, 'error_code': 429}, status=429,
+                                         headers={'Retry-After': '9' * 5000})
+            return self.normal(request, body)
+
+        self.handler = handle
+        _, task = self.start()
+        await self.until(lambda: self.posts('/getUpdates') >= 1 and self.posts('/updates') >= 5)
+        self.assertFalse(task.done())
+        self.assertNotIn('tg', self.bridge.paused)
 
 
 if __name__ == '__main__':

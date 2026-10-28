@@ -625,8 +625,52 @@ class ResilienceTests(unittest.IsolatedAsyncioTestCase):
                    'Wed, 21 Oct 2015 07:28:00 -0000', 'Wed, 21 Oct 99999 07:28:00 GMT']
         for value in invalid:
             self.assertEqual(b.retry_after_seconds(value, now=0), 0, repr(value))
-        for huge in (10 ** 400, '9' * 400, 1e300):
-            self.assertEqual(b.retry_after_seconds(huge), b.RETRY_AFTER_LIMIT, repr(huge)[:20])
+        # Beyond float range: unusable hint, the caller falls back to its own backoff.
+        for huge in (10 ** 400, '9' * 400, '9' * 5000, 1e301):
+            self.assertEqual(b.retry_after_seconds(huge), 0, repr(huge)[:20])
+        self.assertEqual(b.retry_after_seconds('0' * 5000 + '7'), 7)
+        error = b.Api.error('max', 429, {'code': '429'}, '9' * 5000)
+        self.assertEqual((error.code, error.retry_after, error.status), ('429', 0, 429))
+
+    def test_server_delays_longer_than_a_day_are_not_shortened(self):
+        now, two_days = 1_000_000_000.0, 2 * 86400
+        self.assertEqual(b.retry_after_seconds(str(two_days), now=now), two_days)
+        date = email.utils.formatdate(now + two_days, usegmt=True)
+        self.assertAlmostEqual(b.retry_after_seconds(date, now=now), two_days, places=3)
+        self.assertEqual(b.Api.error('tg', 429, {'parameters': {'retry_after': two_days}}).retry_after, two_days)
+        self.assertEqual(b.retry_after_seconds(1e300), 1e300)
+
+    async def test_server_wait_longer_than_a_day_is_persisted(self):
+        self.store.accept('tg', [tg()], 2, '-100', '99')
+        before = time.time()
+        await self.bridge(ScriptedApi(publish=[b.ApiError('max', 429, 2 * 86400, status=429)])).deliver('max')
+        self.assertEqual(self.job()['state'], 'pending')
+        self.assertGreaterEqual(self.job()['ready'], before + 2 * 86400)
+
+    async def test_http_5xx_after_publication_wins_over_retryable_body_code(self):
+        for mid, code in ((1, '429'), (2, 'attachment.not.ready')):
+            self.store.accept('tg', [tg(mid)], mid + 1, '-100', '99')
+            api = ScriptedApi(publish=[b.ApiError('max', code, 5, status=503)])
+            await self.bridge(api).deliver('max')
+            self.assertEqual((self.job(mid)['state'], len(api.calls)), ('uncertain', 1), code)
+            self.make_ready()
+            self.store.recover()
+            restarted = ScriptedApi()
+            await self.bridge(restarted).deliver('max')
+            self.assertEqual((self.job(mid)['state'], restarted.calls), ('uncertain', []), code)
+            self.store.update(mid, 'sent', remote_id=f'found{mid}', counted=True)
+
+    async def test_media_download_rejections_use_retry_after_or_fail(self):
+        self.photo_job()
+        before = time.time()
+        api = ScriptedApi(prepare=[b.ApiError('tg-media', 429, 60, status=429)])
+        await self.bridge(api).deliver('max')
+        self.assertEqual((self.job()['state'], api.calls), ('pending', []))
+        self.assertGreaterEqual(self.job()['ready'], before + 60)
+        self.make_ready()
+        api = ScriptedApi(prepare=[b.ApiError('tg-media', 404, status=404)])
+        await self.bridge(api).deliver('max')
+        self.assertEqual((self.job()['state'], api.calls), ('failed', []))
 
     def test_api_error_takes_the_latest_of_telegram_and_http_hints(self):
         error = b.Api.error('tg', 429, {'error_code': 429, 'parameters': {'retry_after': 5}}, '30')

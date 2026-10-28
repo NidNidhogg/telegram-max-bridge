@@ -32,7 +32,7 @@ MAX_API = 'https://platform-api2.max.ru'
 PHOTO_LIMIT = 10 * 1024 * 1024
 SCHEMA_VERSION = 3
 # Server-requested waits above a day are clamped so that absurd values stay representable.
-RETRY_AFTER_LIMIT = 24 * 3600
+RETRY_AFTER_DIGITS = 300
 # Safe retries: exponential delay base*2**(n-1) up to cap, then +0..20% jitter.
 POLL_BACKOFF = (2, 30)
 SEND_BACKOFF = (2, 120)
@@ -48,9 +48,11 @@ class BridgeError(Exception):
 
 
 class ApiError(BridgeError):
-    def __init__(self, service, code, retry_after=0):
+    def __init__(self, service, code, retry_after=0, status=None):
         self.code = str(code)
         self.retry_after = retry_after
+        # HTTP status is kept apart from the API code: a 5xx may follow a publication.
+        self.status = status
         super().__init__(f'{service}: API error {self.code}')
 
 
@@ -67,28 +69,33 @@ class CertificateError(BridgeError):
 
 
 def retry_after_seconds(value, now=None):
-    """Seconds from Telegram retry_after or HTTP Retry-After (delay-seconds or HTTP-date); 0 if unusable."""
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return 0
-    if isinstance(value, str):
-        text = value.strip()
-        if re.fullmatch('[0-9]+', text):
-            value = int(text)
-        else:
-            try:
-                date = email.utils.parsedate_to_datetime(text)
-            except (TypeError, ValueError, IndexError, OverflowError):
-                return 0
-            if date is None or date.tzinfo is None:
-                return 0
-            value = date.timestamp() - (time.time() if now is None else now)
+    """Seconds from Telegram retry_after or HTTP Retry-After (delay-seconds or HTTP-date).
+
+    Valid server delays are never shortened. Unusable hints (bool, empty, <=0, NaN/Infinity,
+    bad dates, values beyond float range) give 0, so the caller falls back to its own backoff.
+    """
     try:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return 0
+        if isinstance(value, str):
+            text = value.strip()
+            if re.fullmatch('[0-9]+', text):
+                digits = text.lstrip('0') or '0'
+                # int() rejects very long digit strings in Python 3.12; such values are unrepresentable anyway.
+                if len(digits) > RETRY_AFTER_DIGITS:
+                    return 0
+                value = int(digits)
+            else:
+                date = email.utils.parsedate_to_datetime(text)
+                if date is None or date.tzinfo is None:
+                    return 0
+                value = date.timestamp() - (time.time() if now is None else now)
         value = float(value)
-    except OverflowError:
-        return RETRY_AFTER_LIMIT
-    if not math.isfinite(value) or value <= 0:
+    except (TypeError, ValueError, IndexError, OverflowError):
         return 0
-    return min(value, RETRY_AFTER_LIMIT)
+    if not math.isfinite(value) or value <= 0 or value > 10.0 ** RETRY_AFTER_DIGITS:
+        return 0
+    return value
 
 
 def backoff(failures, base, cap, rand=random.random):
@@ -283,7 +290,7 @@ class Api:
         # Only Telegram documents parameters.retry_after; MAX gets the standard header only.
         params = result.get('parameters') if service == 'tg' else None
         retry = retry_after_seconds(params.get('retry_after')) if isinstance(params, dict) else 0
-        return ApiError(service, code, max(retry, retry_after_seconds(retry_header)))
+        return ApiError(service, code, max(retry, retry_after_seconds(retry_header)), status=status)
 
     async def request(self, service, path, method='GET', query=None, body=None, upload=None):
         if service == 'tg':
@@ -337,9 +344,11 @@ class Api:
         else:
             check_media_url(reference)
             url = reference
-        status, data = await self.read(platform, url, limit=PHOTO_LIMIT, redirects=True)
+        meta = {}
+        status, data = await self.read(platform, url, limit=PHOTO_LIMIT, redirects=True, meta=meta)
         if status != 200:
-            raise TransportError('Не удалось скачать картинку')
+            # 429 and 5xx are temporary; any other status is a definite rejection of this media.
+            raise ApiError(platform + '-media', status, retry_after_seconds(meta.get('retry_after')), status=status)
         if data.startswith(b'\xff\xd8\xff'):
             mime = 'image/jpeg'
         elif data.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -820,13 +829,15 @@ class Bridge:
         except ApiError as exc:
             # A definitive rejection is safe to retry. A server 5xx may be post-publication.
             retry = max(exc.retry_after, self.backoff(job))
-            if exc.code in ('429', 'attachment.not.ready'):
+            server_error = any(str(c).isdigit() and int(c) >= 500 for c in (exc.code, exc.status or 0))
+            if publishing and server_error:
+                # HTTP 5xx after the request may have published wins over a retryable body code.
+                state, delay = 'uncertain', 0
+            elif exc.code in ('429', 'attachment.not.ready') or server_error:
                 state, delay = 'pending', retry
                 if publishing and isinstance(photo, dict):
                     # Reuse the uploaded MAX attachment instead of uploading again.
                     self.prepared[job['id']] = (expires, photo)
-            elif exc.code.isdigit() and int(exc.code) >= 500:
-                state, delay = ('uncertain', 0) if publishing else ('pending', retry)
             else:
                 state, delay = 'failed', 0
             self.store.update(job['id'], state, str(exc), delay=delay, counted=publishing)
