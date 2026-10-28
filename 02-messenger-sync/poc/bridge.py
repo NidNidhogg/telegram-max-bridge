@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import contextmanager
+import contextvars
 import email.utils
 import fcntl
 import hashlib
@@ -49,6 +50,20 @@ ERROR_CODES = frozenset({'tls_failed', 'attachment_not_ready', 'server_error', '
                          'storage_error', 'internal_error', 'cancelled', 'bad_response', 'interrupted'})
 WORKERS = ('poll:tg', 'poll:max', 'send:tg', 'send:max')
 RECOVERY_CONFIRMATIONS = 2
+# Progress entry of the worker running in the current task; every HTTP request extends its deadline.
+WORKER = contextvars.ContextVar('worker', default=None)
+
+
+def touch():
+    current = WORKER.get()
+    if current is not None:
+        entry, budget = current
+        entry['until'] = max(entry['until'] or 0, time.time() + budget)
+
+
+def server_failure(exc):
+    """HTTP 5xx by status or by an ASCII three-digit code; untrusted codes never raise."""
+    return any(re.fullmatch(r'[0-9]{3}', str(c)) and int(c) >= 500 for c in (exc.code, exc.status or 0))
 MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
                  'vkuserphoto.ru', 'vk-cdn.net')
 
@@ -141,10 +156,11 @@ def error_info(exc):
     if isinstance(exc, ApiError):
         status = exc.status if isinstance(exc.status, int) and not isinstance(exc.status, bool) else None
         code = exc.code
+        # HTTP 5xx wins over a body code, as in the delivery policy.
+        if server_failure(exc):
+            return 'server_error', status
         if code == 'attachment.not.ready':
             return 'attachment_not_ready', status
-        if any(str(c).isdigit() and int(c) >= 500 for c in (code, status or 0)):
-            return 'server_error', status
         return {'429': 'rate_limited', '401': 'auth_rejected', '403': 'auth_rejected',
                 '409': 'poll_conflict'}.get(code, 'api_rejected'), status
     if isinstance(exc, ConnectError):
@@ -317,6 +333,7 @@ class Api:
                    limit=2 * 1024 * 1024, redirects=False, meta=None):
         try:
             for hop in range(6):
+                touch()
                 async with self.sessions[platform].request(method, url, headers=headers,
                         data=data, allow_redirects=False) as response:
                     if response.status in (301, 302, 303, 307, 308) and redirects:
@@ -348,7 +365,7 @@ class Api:
         result = result if isinstance(result, dict) else {}
         code = result.get('error_code', result.get('code', status))
         if (not isinstance(code, (str, int)) or len(str(code)) > 64
-                or (str(code) != 'attachment.not.ready' and not str(code).isdigit())):
+                or (str(code) != 'attachment.not.ready' and not re.fullmatch(r'[0-9]{1,64}', str(code)))):
             code = status
         # Only Telegram documents parameters.retry_after; MAX gets the standard header only.
         params = result.get('parameters') if service == 'tg' else None
@@ -843,11 +860,13 @@ class Bridge:
         # In-memory progress of each poller/sender; the heartbeat persists it, it never advances it.
         self.workers = {}
         total = getattr(getattr(api, 'timeout', None), 'total', None) or 25
-        self.budgets = {'poll': total + 5, 'deliver': 5 * total + 5}
+        # Per HTTP request: an operation stays healthy while each of its requests starts in time.
+        self.budgets = {'poll': total + 5, 'deliver': total + 5}
 
     def phase(self, worker, phase, until=None, reason=None):
-        now = time.time()
-        self.workers[worker] = {'phase': phase, 'since': now, 'until': until, 'reason': reason}
+        entry = {'phase': phase, 'since': time.time(), 'until': until, 'reason': reason}
+        self.workers[worker] = entry
+        WORKER.set((entry, self.budgets[phase]) if phase in self.budgets else None)
 
     async def poll(self, platform):
         try:
@@ -929,7 +948,7 @@ class Bridge:
         except ApiError as exc:
             # A definitive rejection is safe to retry. A server 5xx may be post-publication.
             retry = max(exc.retry_after, self.backoff(job))
-            server_error = any(str(c).isdigit() and int(c) >= 500 for c in (exc.code, exc.status or 0))
+            server_error = server_failure(exc)
             if publishing and server_error:
                 # HTTP 5xx after the request may have published wins over a retryable body code.
                 finish('uncertain', exc)
@@ -1024,7 +1043,7 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
     if install_signals:
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(signum, stop.set)
-    RUN['id'] = secrets.token_hex(8)
+    RUN['id'] = RUN['id'] or secrets.token_hex(8)
     try:
         bridge.store.runtime('running', RUN['id'])
         log('info', 'bridge_started')
@@ -1347,6 +1366,13 @@ class AlertMonitor:
             if not snapshot['platforms']:
                 # An unreadable/missing state is not evidence that known faults recovered.
                 current = {**previous, **current}
+            assessed = snapshot.get('workers') or {}
+            for key, entry in previous.items():
+                # A worker that could not be observed (stale heartbeat, stopped process) has not recovered.
+                worker = key[len('worker:'):] if key.startswith('worker:') else (
+                    'poll:' + key[len('paused:'):] if key.startswith('paused:') else None)
+                if worker and key not in current and worker not in assessed:
+                    current[key] = entry
             known = dict(current)
             for key in sorted(set(current) | set(previous)):
                 if key in current:
@@ -1397,9 +1423,8 @@ def monitor(state, args):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     with process_lock(state, 'monitor.lock'):
         alerts = AlertMonitor(state / 'monitor.sqlite3')
-        RUN['id'] = secrets.token_hex(8)
-        if args.alerts_file is not None:
-            log('info', 'monitor_started')
+        RUN['id'] = RUN['id'] or secrets.token_hex(8)
+        log('info', 'monitor_started')
         stopping = False
 
         def stop(_signum, _frame):
@@ -1420,6 +1445,7 @@ def monitor(state, args):
             alerts.db.close()
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
+            log('info', 'monitor_stopped')
 
 
 def queue_view(store, command, action, target_id=None, limit=100):
@@ -1498,6 +1524,7 @@ def main(argv=None):
     if args.command in ('run', 'monitor'):
         # Long-running commands write JSON Lines; the other CLI commands keep their human/JSON output.
         RUN['component'] = 'bridge' if args.command == 'run' else 'monitor'
+        RUN['id'] = secrets.token_hex(8)
     state = args.state_dir
     db_path = state / 'bridge.sqlite3'
     if args.command == 'monitor':

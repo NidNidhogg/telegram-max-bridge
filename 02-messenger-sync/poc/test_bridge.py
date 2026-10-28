@@ -580,9 +580,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with redirect_stdout(output):
             b.main(['monitor', '--once', '--state-dir', self.tmp.name])
             b.main(['monitor', '--once', '--state-dir', self.tmp.name])
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        events = [r for r in records if 'kind' in r]
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]['kind'], 'problem')
+        # Each monitor run logs its start and stop with its own non-empty run_id.
+        logs = [(r['event'], r['run_id']) for r in records if 'kind' not in r]
+        self.assertEqual([e for e, _ in logs], ['monitor_started', 'monitor_stopped'] * 2)
+        self.assertTrue(all(isinstance(r, str) and r for _, r in logs))
+        self.assertEqual(len({r for _, r in logs}), 2)
+        self.assertEqual(events[0]['run_id'], logs[0][1])
 
     async def test_corrupt_state_is_reported_without_raw_database_error(self):
         path = Path(self.tmp.name) / 'bridge.sqlite3'

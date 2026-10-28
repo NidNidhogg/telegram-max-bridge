@@ -1,5 +1,6 @@
 """Async transport/runtime checks against a real local HTTP server; no live tokens."""
 import asyncio
+import os
 from contextlib import redirect_stdout
 import email.utils
 import io
@@ -921,6 +922,86 @@ class RuntimeTests(HttpServer):
         await self.until(lambda: self.posts('/getUpdates') > polls + 3)
         release.set()
         await self.until(lambda: 'worker_stalled' not in {c for c, _ in found()[1]})
+
+
+    async def test_untrusted_api_code_does_not_stop_the_bridge(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': False, 'error_code': '\u00b2'}, status=429)
+            return self.normal(request, body)
+
+        self.handler = handle
+        with redirect_stdout(io.StringIO()):
+            _, task = self.start()
+            await self.until(lambda: self.store.get('last_poll_error_tg'))
+            polls = self.posts('/updates')
+            await self.until(lambda: self.posts('/updates') > polls + 3)
+        self.assertFalse(task.done())
+        self.assertEqual(self.store.get('runtime_state'), 'running')
+        self.assertTrue(self.store.get('last_poll_error_tg').startswith('rate_limited http=429'))
+
+    async def test_http_5xx_reason_wins_over_attachment_not_ready_body(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.handler = lambda request, body: (web.json_response({'code': 'attachment.not.ready'}, status=503)
+                                              if request.path == '/messages' else self.normal(request, body))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            await self.bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+        record = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual((record['event'], record['error_code'], record['http_status']),
+                         ('delivery_uncertain', 'server_error', 503))
+        snapshot = b.health_snapshot(self.store, running=True)
+        self.assertEqual(snapshot['platforms']['max']['delivery']['head']['reason'], 'server_error')
+
+    async def test_slow_but_progressing_photo_delivery_is_not_a_stall(self):
+        event = tg(2)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 3, '-100', '99')
+        self.client.tg_file_base = self.url + '/files'
+        self.original_media_check = b.check_media_url
+
+        async def handle(request, body):
+            if request.path in ('/getFile', '/files/image.jpg', '/uploads', '/upload', '/messages'):
+                await asyncio.sleep(0.2)
+            if request.path == '/getFile':
+                return web.json_response({'ok': True, 'result': {'file_path': 'image.jpg'}})
+            if request.path == '/files/image.jpg':
+                return web.Response(body=b'\xff\xd8\xffphoto')
+            if request.path == '/uploads':
+                return web.json_response({'url': self.url + '/upload'})
+            if request.path == '/upload':
+                return web.json_response({'token': 'photo-token'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        self.bridge.budgets = {'poll': 0.3, 'deliver': 0.3}
+        seen = set()
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media), redirect_stdout(io.StringIO()):
+            self.start()
+
+            def sample():
+                snapshot = b.health_snapshot(self.store, running=True, stale_after=0.2)
+                seen.update(i.get('worker') for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+                return self.state(1) == 'sent'
+
+            await self.until(sample, 10)
+        self.assertNotIn('send:max', seen)
+
+    async def test_cli_run_failure_has_run_id_in_json(self):
+        import sys
+        with tempfile.TemporaryDirectory() as state:
+            env = {'PATH': os.environ.get('PATH', ''), 'HOME': state, 'TG_BOT_TOKEN': '', 'MAX_BOT_TOKEN': ''}
+            runs = [subprocess.run([sys.executable, b.__file__, 'run', '--state-dir', state], env=env,
+                                   capture_output=True, text=True, timeout=60) for _ in range(2)]
+        ids = []
+        for run in runs:
+            self.assertEqual(run.returncode, 1, run.stderr)
+            records = [json.loads(line) for line in (run.stdout + run.stderr).splitlines() if line.strip()]
+            failure = next(r for r in records if r['event'] == 'stopped_with_error')
+            self.assertTrue(isinstance(failure['run_id'], str) and failure['run_id'])
+            ids.append(failure['run_id'])
+        self.assertNotEqual(ids[0], ids[1])
 
 
 if __name__ == '__main__':
