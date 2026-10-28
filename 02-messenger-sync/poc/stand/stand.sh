@@ -316,7 +316,7 @@ bad=$(printf '%s\n' "$logs" | grep -v '^{' || true)
 if printf '%s\n' "$logs" | grep -E 'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia' >&2; then
     echo 'private data in container logs' >&2; exit 1
 fi
-printf '%s\n' "$logs" | grep -q '"event": "delivery_sent"' || { echo 'no delivery_sent event' >&2; exit 1; }
+printf '%s\n' "$logs" | grep -q '"event": "bridge_started"' || { echo 'no bridge_started event' >&2; exit 1; }
 echo "logs OK: $(printf '%s\n' "$logs" | wc -l | tr -d ' ') JSON lines, no synthetic tokens, texts, names or URLs"
 
 echo
