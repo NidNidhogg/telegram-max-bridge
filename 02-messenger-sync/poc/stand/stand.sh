@@ -23,12 +23,15 @@ export HEALTH_STALE_AFTER=6 HEALTH_QUEUE_AGE=8 HEALTH_INTERVAL=1s HEALTH_START_P
 C="docker compose -p $PROJECT -f compose.yaml -f 02-messenger-sync/poc/stand/compose.stand.yaml"
 M="make --no-print-directory PROJECT=$PROJECT"
 BROKEN=$(mktemp)
+LOGS=$(mktemp)
 
 step() { echo; echo "== $*"; }
+# Logs of a container are lost when it is recreated: keep them for the final contract check.
+keep_logs() { $C logs --no-log-prefix bridge monitor >>"$LOGS" 2>&1 || true; }
 ctl() { $C run --rm --no-deps -T ctl "$@"; }
 cid() { $C ps -aq bridge; }
 cleanup() {
-    rm -f "$BROKEN"
+    rm -f "$BROKEN" "$LOGS"
     [ "${KEEP_STAND:-0}" = 1 ] || $C --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -80,7 +83,7 @@ ctl pending-start
 health_is unhealthy
 ctl health queue_too_old
 old=$(cid)
-$C up -d --force-recreate --no-deps bridge
+keep_logs; $C up -d --force-recreate --no-deps bridge
 [ "$old" != "$(cid)" ] || { echo 'bridge container was not recreated' >&2; exit 1; }
 ctl pending-check
 ctl pending-release
@@ -168,7 +171,7 @@ for scenario in 'error_after d2-5xx 641' 'drop_after d2-drop 642'; do
     set -- $scenario
     step "D2: $1 after a possible publication stays uncertain across recreation"
     set -- $(ctl d2-uncertain "$@") "$2" "$3"
-    $C up -d --force-recreate --no-deps bridge
+    keep_logs; $C up -d --force-recreate --no-deps bridge
     ctl d2-uncertain-stays "$3" "$4"
     ctl health delivery_blocked
     $M COMPOSE="$C" stop-bridge
@@ -179,14 +182,14 @@ health_is healthy
 
 step 'D2: recreation while a retry is scheduled keeps the job, reply link and retry time'
 ready=$(ctl d2-wait-start)
-$C up -d --force-recreate --no-deps bridge
+keep_logs; $C up -d --force-recreate --no-deps bridge
 ctl d2-wait-check "$ready"
 health_is healthy
 
 # D3 crash points: stand_bridge.py stops itself (SIGSTOP) at the armed point, the script checks
 # SQLite and the mock, then SIGKILLs the container and starts a new, unarmed one.
-arm() { STAND_FREEZE=$1 $C up -d --force-recreate --no-deps bridge; }
-fresh() { $C up -d --force-recreate --no-deps bridge; }
+arm() { keep_logs; STAND_FREEZE=$1 $C up -d --force-recreate --no-deps bridge; }
+fresh() { keep_logs; $C up -d --force-recreate --no-deps bridge; }
 # The restart policy is switched off first: an automatic restart must not race with the checks.
 crash() {
     docker update --restart=no "$(cid)" >/dev/null
@@ -310,14 +313,8 @@ for worker in poll:tg send:max poll:max send:tg; do
 done
 
 step 'D4: bridge and monitor logs are JSON Lines without tokens, texts or author names'
-logs=$($C logs --no-log-prefix bridge monitor 2>&1)
-bad=$(printf '%s\n' "$logs" | grep -v '^{' || true)
-[ -z "$bad" ] || { echo "non-JSON log lines: $bad" >&2; exit 1; }
-if printf '%s\n' "$logs" | grep -E 'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia' >&2; then
-    echo 'private data in container logs' >&2; exit 1
-fi
-printf '%s\n' "$logs" | grep -q '"event": "bridge_started"' || { echo 'no bridge_started event' >&2; exit 1; }
-echo "logs OK: $(printf '%s\n' "$logs" | wc -l | tr -d ' ') JSON lines, no synthetic tokens, texts, names or URLs"
+keep_logs
+ctl d4-logs <"$LOGS"
 
 echo
 echo 'Container stand passed: synthetic data only, no real API calls'

@@ -356,6 +356,32 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     def codes(self, snapshot):
         return {(i['code'], i.get('worker') or i.get('platform')) for i in snapshot['issues']}
 
+    async def test_monitor_does_not_confirm_recovery_of_a_worker_it_cannot_observe(self):
+        monitor = b.AlertMonitor(':memory:')
+        try:
+            emitted = []
+            stalled = {'phase': 'deliver', 'since': 900, 'until': 990, 'reason': None}
+            self.telemetry({'send:max': stalled}, now=1000)
+            monitor.observe(b.health_snapshot(self.store, now=1000, running=True, stale_after=5))
+            # The whole process froze: heartbeat and worker data stop, the worker cannot be assessed.
+            for now in (1007, 1008, 1009):
+                monitor.observe(b.health_snapshot(self.store, now=now, running=True, stale_after=5))
+            monitor.flush(emitted.append)
+            stall = [a['kind'] for a in emitted if a['issue']['code'] == 'worker_stalled']
+            self.assertEqual(stall, ['problem'])
+            ok = {'phase': 'wait', 'since': 1010, 'until': 1012, 'reason': None}
+            self.telemetry({'send:max': ok}, now=1010)
+            monitor.observe(b.health_snapshot(self.store, now=1010, running=True, stale_after=5))
+            monitor.flush(emitted.append)
+            self.assertEqual([a['kind'] for a in emitted if a['issue']['code'] == 'worker_stalled'], ['problem'])
+            self.telemetry({'send:max': ok}, now=1011)
+            monitor.observe(b.health_snapshot(self.store, now=1011, running=True, stale_after=5))
+            monitor.flush(emitted.append)
+            self.assertEqual([a['kind'] for a in emitted if a['issue']['code'] == 'worker_stalled'],
+                             ['problem', 'recovery'])
+        finally:
+            monitor.db.close()
+
     async def test_worker_telemetry_reports_stall_and_pause_but_not_planned_waits(self):
         ok = {'phase': 'wait', 'since': 990, 'until': 1001, 'reason': None}
         stalled = {'phase': 'deliver', 'since': 500, 'until': 600, 'reason': None}
@@ -1054,6 +1080,23 @@ except sqlite3.Error as exc:
             self.assertEqual(json.loads(conn.execute("SELECT value FROM meta WHERE key='identity'").fetchone()[0])[0], '1')
         finally:
             conn.close()
+
+    def test_stand_log_check_rejects_broken_json_missing_run_id_and_old_markers(self):
+        spec = importlib.util.spec_from_file_location('stand_ctl', Path(__file__).parent / 'stand' / 'stand_ctl.py')
+        ctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ctl)
+        good = json.dumps({'timestamp': '2026-01-01T00:00:00.000Z', 'level': 'info', 'component': 'bridge',
+                           'event': 'bridge_started', 'run_id': 'abc'})
+        self.assertEqual(len(ctl.check_logs([good, 'stand: worker send:tg frozen', good], ['bridge_started'])), 2)
+        bad = {'broken': [good, '{broken'],
+               'null run_id': [good.replace('"abc"', 'null')],
+               'missing run_id': [json.dumps({'timestamp': 't', 'level': 'info', 'component': 'bridge', 'event': 'x'})],
+               'not an object': ['[1]'],
+               'marker in an earlier container': ['{"x": "synthetic-tg-token"}', good],
+               'missing event': [good]}
+        for name, lines in bad.items():
+            with self.subTest(name), self.assertRaises(AssertionError):
+                ctl.check_logs(lines, ['delivery_sent'] if name == 'missing event' else ())
 
     def test_stand_snapshot_ignores_sidecar_files_but_detects_data_changes(self):
         spec = importlib.util.spec_from_file_location('stand_ctl', Path(__file__).parent / 'stand' / 'stand_ctl.py')

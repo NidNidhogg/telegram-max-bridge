@@ -3,6 +3,7 @@
 import email.utils
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -610,6 +611,45 @@ def step_d4_recovered(worker):
     until(lambda: alerts('recovery', worker), f'monitor recovery for {worker}', 60)
     assert len(alerts('problem', worker)) == 1 and len(alerts('recovery', worker)) == 1, worker
     print(f'D4 recovered OK: {worker} healthy in the new container; exactly one problem and one recovery event')
+
+LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia')
+LOG_EVENTS = ('preflight_ok', 'bridge_started', 'bridge_stopped', 'delivery_sent', 'delivery_retry_scheduled',
+              'delivery_failed', 'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
+
+
+def check_logs(lines, required=()):
+    """Every application line is a JSON object with the D4 fields; only stand wrapper lines are text."""
+    records = []
+    for number, line in enumerate(lines, 1):
+        line = line.rstrip('\n')
+        if LOG_MARKERS.search(line):
+            raise AssertionError(f'log line {number}: private marker')
+        if line.startswith('stand: '):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            raise AssertionError(f'log line {number}: not JSON') from None
+        if not isinstance(record, dict):
+            raise AssertionError(f'log line {number}: not a JSON object')
+        for key in ('timestamp', 'component', 'event', 'run_id'):
+            if not isinstance(record.get(key), str) or not record[key]:
+                raise AssertionError(f'log line {number}: {key} missing or empty')
+        if record.get('level') not in ('debug', 'info', 'warning', 'error') or \
+                record['component'] not in ('bridge', 'monitor'):
+            raise AssertionError(f'log line {number}: bad level or component')
+        records.append(record)
+    missing = sorted(set(required) - {r['event'] for r in records})
+    if missing:
+        raise AssertionError(f'log events missing: {missing}')
+    return records
+
+
+def step_d4_logs():
+    records = check_logs(sys.stdin.readlines(), LOG_EVENTS)
+    runs = {r['run_id'] for r in records}
+    print(f'logs OK: {len(records)} JSON records from {len(runs)} runs, no synthetic tokens, texts, names or URLs')
+
 
 if __name__ == '__main__':
     globals()['step_' + sys.argv[1].replace('-', '_')](*sys.argv[2:])
