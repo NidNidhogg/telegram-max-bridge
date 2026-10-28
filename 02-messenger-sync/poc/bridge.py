@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import contextmanager
+import email.utils
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,8 @@ import math
 import mimetypes
 import os
 from pathlib import Path
+import random
+import re
 import secrets
 import signal
 import sqlite3
@@ -28,6 +31,14 @@ STATE = ROOT / '.state'
 MAX_API = 'https://platform-api2.max.ru'
 PHOTO_LIMIT = 10 * 1024 * 1024
 SCHEMA_VERSION = 3
+# Server-requested waits above a day are clamped so that absurd values stay representable.
+RETRY_AFTER_LIMIT = 24 * 3600
+# Safe retries: exponential delay base*2**(n-1) up to cap, then +0..20% jitter.
+POLL_BACKOFF = (2, 30)
+SEND_BACKOFF = (2, 120)
+BACKOFF_JITTER = 0.2
+# A prepared MAX attachment is reused for this long after attachment.not.ready / 429.
+ATTACHMENT_REUSE = 600
 MEDIA_DOMAINS = ('oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'userapi.com',
                  'vkuserphoto.ru', 'vk-cdn.net')
 
@@ -44,7 +55,46 @@ class ApiError(BridgeError):
 
 
 class TransportError(BridgeError):
-    pass
+    """Network failure after the request may have reached the server."""
+
+
+class ConnectError(TransportError):
+    """No connection was established, so the request was provably not sent."""
+
+
+class CertificateError(BridgeError):
+    """TLS certificate verification failed; a retry cannot help."""
+
+
+def retry_after_seconds(value, now=None):
+    """Seconds from Telegram retry_after or HTTP Retry-After (delay-seconds or HTTP-date); 0 if unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch('[0-9]+', text):
+            value = int(text)
+        else:
+            try:
+                date = email.utils.parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return 0
+            if date is None or date.tzinfo is None:
+                return 0
+            value = date.timestamp() - (time.time() if now is None else now)
+    try:
+        value = float(value)
+    except OverflowError:
+        return RETRY_AFTER_LIMIT
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return min(value, RETRY_AFTER_LIMIT)
+
+
+def backoff(failures, base, cap, rand=random.random):
+    """Positive bounded exponential delay with bounded jitter: [d, d*(1+BACKOFF_JITTER)]."""
+    delay = min(cap, base * 2 ** min(max(failures, 1) - 1, 30))
+    return delay * (1 + BACKOFF_JITTER * min(max(rand(), 0.0), 1.0))
 
 
 class EventError(BridgeError):
@@ -194,7 +244,7 @@ class Api:
         self.sessions.clear()
 
     async def read(self, platform, url, *, method='GET', headers=None, data=None,
-                   limit=2 * 1024 * 1024, redirects=False):
+                   limit=2 * 1024 * 1024, redirects=False, meta=None):
         try:
             for hop in range(6):
                 async with self.sessions[platform].request(method, url, headers=headers,
@@ -212,22 +262,28 @@ class Api:
                         if size > limit:
                             raise TransportError('Превышен предел размера ответа')
                         chunks.append(chunk)
+                    if meta is not None:
+                        meta['retry_after'] = response.headers.get('Retry-After')
                     return response.status, b''.join(chunks)
+        except aiohttp.ClientConnectorCertificateError:
+            raise CertificateError('Ошибка проверки TLS-сертификата') from None
+        except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
+            # Raised while connecting (or waiting for a pooled connection): nothing was sent.
+            raise ConnectError('Соединение не установлено; запрос не отправлен') from None
         except (aiohttp.ClientError, OSError, TimeoutError):
             raise TransportError('Ошибка соединения или TLS') from None
 
     @staticmethod
-    def error(service, status, result):
+    def error(service, status, result, retry_header=None):
         result = result if isinstance(result, dict) else {}
         code = result.get('error_code', result.get('code', status))
         if (not isinstance(code, (str, int)) or len(str(code)) > 64
                 or (str(code) != 'attachment.not.ready' and not str(code).isdigit())):
             code = status
-        params = result.get('parameters')
-        retry = params.get('retry_after', 0) if isinstance(params, dict) else 0
-        if not isinstance(retry, (float, int)) or not math.isfinite(retry) or retry < 0:
-            retry = 0
-        return ApiError(service, code, retry)
+        # Only Telegram documents parameters.retry_after; MAX gets the standard header only.
+        params = result.get('parameters') if service == 'tg' else None
+        retry = retry_after_seconds(params.get('retry_after')) if isinstance(params, dict) else 0
+        return ApiError(service, code, max(retry, retry_after_seconds(retry_header)))
 
     async def request(self, service, path, method='GET', query=None, body=None, upload=None):
         if service == 'tg':
@@ -248,15 +304,17 @@ class Api:
             headers['Content-Type'] = 'application/json'
         else:
             data = None
-        status, raw = await self.read(platform, url, method=method, headers=headers, data=data)
+        meta = {}
+        status, raw = await self.read(platform, url, method=method, headers=headers, data=data, meta=meta)
+        retry_header = meta.get('retry_after')
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeError):
             if status >= 300:
-                raise self.error(service, status, {}) from None
+                raise self.error(service, status, {}, retry_header) from None
             raise TransportError(f'{service}: не удалось разобрать ответ API') from None
         if status >= 300:
-            raise self.error(service, status, result)
+            raise self.error(service, status, result, retry_header)
         if not isinstance(result, dict):
             raise TransportError(f'{service}: неожиданный формат ответа')
         if service == 'tg':
@@ -627,11 +685,12 @@ class Store:
                               (job['source'], job['chat'], job['parent'])).fetchone()
         return row[0] if row else None
 
-    def update(self, jid, state, error=None, remote_id=None, delay=0):
+    def update(self, jid, state, error=None, remote_id=None, delay=0, counted=False):
+        # counted: start_sending already counted this attempt as a publication.
         with self.db:
             now = time.time()
-            self.db.execute('''UPDATE jobs SET state=?,error=?,remote_id=?,ready=?,attempts=attempts+1,updated=?
-                               WHERE id=?''', (state, error, remote_id, now + delay, now, jid))
+            self.db.execute('''UPDATE jobs SET state=?,error=?,remote_id=?,ready=?,attempts=attempts+?,updated=?
+                               WHERE id=?''', (state, error, remote_id, now + delay, 0 if counted else 1, now, jid))
             if state == 'sent':
                 row = self.db.execute('SELECT destination FROM jobs WHERE id=?', (jid,)).fetchone()
                 self.set('last_delivery_success_' + row['destination'], now)
@@ -696,6 +755,8 @@ class Bridge:
     def __init__(self, cfg, api, store, ids, *, send_intervals=None):
         self.cfg, self.api, self.store, self.ids = cfg, api, store, ids
         self.paused = set()
+        self.random = random.random
+        self.prepared = {}
         self.send_intervals = {'tg': 3.2, 'max': 0.6} if send_intervals is None else send_intervals
 
     async def poll(self, platform):
@@ -730,8 +791,12 @@ class Bridge:
         target = self.cfg[destination.upper() + '_CHAT_ID']
         parent = self.store.parent_id(job) if job['part'] == 0 else None
         publishing = False
+        cached = self.prepared.pop(job['id'], None)
+        expires, photo = cached if cached and cached[0] > time.monotonic() else (0, None)
         try:
-            photo = await self.api.prepare_photo(job['source'], part['reference'], destination) if part['kind'] == 'photo' else None
+            if part['kind'] == 'photo' and photo is None:
+                photo = await self.api.prepare_photo(job['source'], part['reference'], destination)
+                expires = time.monotonic() + ATTACHMENT_REUSE
             if (stop is not None and stop.is_set()) or destination in self.paused:
                 return
             service, path, kwargs = publication(destination, target, part, parent, photo)
@@ -746,36 +811,47 @@ class Bridge:
                     (not str(remote_id).isdigit() or int(remote_id) <= 0))):
                 raise TransportError('API не вернул корректный ID опубликованного сообщения')
             remote_id = str(remote_id)
-            self.store.update(job['id'], 'sent', remote_id=remote_id)
+            self.store.update(job['id'], 'sent', remote_id=remote_id, counted=True)
             print(f"sent job={job['id']} {job['source']}->{destination}", flush=True)
         except asyncio.CancelledError:
             if publishing:
-                self.store.update(job['id'], 'uncertain', 'Отмена во время публикации; требуется сверка')
+                self.store.update(job['id'], 'uncertain', 'Отмена во время публикации; требуется сверка', counted=True)
             raise
         except ApiError as exc:
             # A definitive rejection is safe to retry. A server 5xx may be post-publication.
+            retry = max(exc.retry_after, self.backoff(job))
             if exc.code in ('429', 'attachment.not.ready'):
-                state, delay = 'pending', max(float(exc.retry_after or 0), min(120, 2 ** min(job['attempts'] + 1, 6)))
+                state, delay = 'pending', retry
+                if publishing and isinstance(photo, dict):
+                    # Reuse the uploaded MAX attachment instead of uploading again.
+                    self.prepared[job['id']] = (expires, photo)
             elif exc.code.isdigit() and int(exc.code) >= 500:
-                state, delay = ('uncertain', 0) if publishing else ('pending', 30)
+                state, delay = ('uncertain', 0) if publishing else ('pending', retry)
             else:
                 state, delay = 'failed', 0
-            self.store.update(job['id'], state, str(exc), delay=delay)
+            self.store.update(job['id'], state, str(exc), delay=delay, counted=publishing)
             print(f"{state} job={job['id']} {exc}", flush=True)
         except TransportError as exc:
-            state = 'uncertain' if publishing else 'pending'
-            self.store.update(job['id'], state, str(exc), delay=30)
+            # ConnectError proves the request was not sent, even during publication.
+            state = 'uncertain' if publishing and not isinstance(exc, ConnectError) else 'pending'
+            self.store.update(job['id'], state, str(exc), delay=self.backoff(job) if state == 'pending' else 0,
+                              counted=publishing)
             print(f"{state} job={job['id']} {exc}", flush=True)
         except (KeyError, TypeError, ValueError):
             state = 'uncertain' if publishing else 'failed'
-            self.store.update(job['id'], state, 'Неожиданный формат ответа API')
+            self.store.update(job['id'], state, 'Неожиданный формат ответа API', counted=publishing)
             print(f"{state} job={job['id']} unexpected-response", flush=True)
         except BridgeError as exc:
-            self.store.update(job['id'], 'failed', str(exc))
+            self.store.update(job['id'], 'failed', str(exc), counted=publishing)
             print(f"failed job={job['id']} {exc}", flush=True)
         finally:
             with self.store.db:
                 self.store.set('next_' + destination, time.time() + self.send_intervals[destination])
+
+
+    def backoff(self, job):
+        # attempts counts each preparation or publication attempt of this queue head once.
+        return backoff(job['attempts'] + 1, *SEND_BACKOFF, rand=self.random)
 
 
 async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.2,
@@ -807,12 +883,12 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                     raise BridgeError(f'{platform}: конфликт другого poller; мост остановлен') from None
                 if failures == 1 or failures % 30 == 0:
                     print(f'poll {platform}: {exc}', flush=True)
-                delay = min(30, 2 ** min(failures, 5))
+                delay = backoff(failures, *POLL_BACKOFF, rand=bridge.random)
                 if isinstance(exc, ApiError):
-                    delay = max(delay, float(exc.retry_after or 0))
-                    if exc.code in ('401', '403'):
-                        bridge.paused.add(platform)
-                        print(f'{platform}: приём/отправка приостановлены; проверьте права и перезапустите мост', flush=True)
+                    delay = max(delay, exc.retry_after)
+                if (isinstance(exc, ApiError) and exc.code in ('401', '403')) or isinstance(exc, CertificateError):
+                    bridge.paused.add(platform)
+                    print(f'{platform}: приём/отправка приостановлены; проверьте права/сертификат и перезапустите мост', flush=True)
             await wait(delay)
 
     async def sender(platform):

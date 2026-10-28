@@ -25,6 +25,7 @@ x-synthetic: &synthetic
   TG_CHAT_ID: "-100"
   MAX_CHAT_ID: "-200"
   STAND_API_BASE: http://mockapi:8080
+  STAND_MAX_BASE: http://mockapi:8081
   HEALTH_STALE_AFTER: ${HEALTH_STALE_AFTER}
   HEALTH_QUEUE_AGE: ${HEALTH_QUEUE_AGE}
 
