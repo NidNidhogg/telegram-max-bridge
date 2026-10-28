@@ -61,8 +61,10 @@ $C up -d --wait --wait-timeout 120 mockapi bridge monitor
 step 'isolation and hardening'
 for service in bridge monitor; do
     id=$($C ps -q $service)
-    docker inspect -f '{{.Config.User}} privileged={{.HostConfig.Privileged}} ports={{json .HostConfig.PortBindings}} mounts={{range .Mounts}}{{.Destination}} {{end}}' "$id" | tee /dev/stderr \
-        | grep -q '^10001:10001 privileged=false ports={} mounts=/state $'
+    # No `tee /dev/stderr`: reopening it truncates a stand log redirected to a file.
+    info=$(docker inspect -f '{{.Config.User}} privileged={{.HostConfig.Privileged}} ports={{json .HostConfig.PortBindings}} mounts={{range .Mounts}}{{.Destination}} {{end}}' "$id")
+    echo "$info" >&2
+    [ "$info" = '10001:10001 privileged=false ports={} mounts=/state ' ]
 done
 $C exec -T bridge sh -ec 'test "$(id -u)" = 10001; tr "\0" " " </proc/1/cmdline | grep -q docker-init
     ! find / -xdev \( -path /proc -o -path /app/.venv -o -path /state \) -prune -o \( -name ".env" -o -name ".env.*" -o -name ".state" -o -name "*.sqlite3*" -o -name "*.jsonl" \) -print 2>/dev/null | grep .'
