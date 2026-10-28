@@ -270,13 +270,21 @@ confirm_id=$1 confirm_remote=$2
 
 step 'D3: read-only diagnostics do not change the stopped database; operator resolves uncertain'
 $M COMPOSE="$C" stop-bridge
-before=$(ctl d3-hash)
-$M COMPOSE="$C" status >/dev/null 2>&1 || true
-$M COMPOSE="$C" health >/dev/null 2>&1 || true
-$M COMPOSE="$C" cli ARGS='queue list' >/dev/null
-$M COMPOSE="$C" cli ARGS='quarantine list' >/dev/null
-[ "$before" = "$(ctl d3-hash)" ] || { echo 'read-only diagnostics changed the database' >&2; exit 1; }
-echo "read-only OK: status/health/queue list/quarantine list left $before unchanged"
+# Logical snapshot (user_version, schema, all rows); WAL/SHM files may legitimately appear on read.
+before=$(ctl d3-snapshot)
+fail() { echo "read-only check: $*" >&2; exit 1; }
+$M COMPOSE="$C" status >/dev/null || fail 'make status failed'
+if $M COMPOSE="$C" health >/dev/null; then fail 'make health reported ok for a stopped bridge'; fi
+out=$($M -s COMPOSE="$C" cli ARGS='status --json') || fail 'status --json failed'
+case "$out" in *'"schema_version": 3'*'process_stopped'*) ;; *) fail "unexpected status: $out" ;; esac
+if out=$($M -s COMPOSE="$C" cli ARGS='health --json'); then fail 'health --json reported ok'; fi
+case "$out" in *'"ok": false'*'process_stopped'*) ;; *) fail "unexpected health: $out" ;; esac
+for what in queue quarantine; do
+    out=$($M -s COMPOSE="$C" cli ARGS="$what list") || fail "$what list failed"
+    case "$out" in '['*']') ;; *) fail "unexpected $what list: $out" ;; esac
+done
+[ "$before" = "$(ctl d3-snapshot)" ] || fail 'diagnostics changed data, schema or delivery states'
+echo "read-only OK: status/health (exit 0/1, JSON) and queue/quarantine list kept logical snapshot $before"
 $M COMPOSE="$C" cli ARGS="queue skip $skip_id --reason 'stand: uncertain part never published'"
 $M COMPOSE="$C" cli ARGS="queue confirm $confirm_id --remote-id $confirm_remote --reason 'stand: copy found in target group'"
 $C start bridge

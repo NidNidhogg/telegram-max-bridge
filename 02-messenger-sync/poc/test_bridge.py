@@ -968,6 +968,38 @@ except sqlite3.Error as exc:
         finally:
             conn.close()
 
+    def test_stand_snapshot_ignores_sidecar_files_but_detects_data_changes(self):
+        spec = importlib.util.spec_from_file_location('stand_ctl', Path(__file__).parent / 'stand' / 'stand_ctl.py')
+        ctl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ctl)
+        store = self.open()
+        store.accept('tg', [tg()], 2, '-100', '99')
+        store.db.close()
+        before = ctl.logical_snapshot(self.path)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(b.main(['status', '--json', '--state-dir', str(self.path.parent)]), 0)
+        self.assertEqual(json.loads(output.getvalue())['schema_version'], b.SCHEMA_VERSION)
+        self.assertEqual(ctl.logical_snapshot(self.path), before)
+        reader = sqlite3.connect(self.path)
+        try:
+            reader.execute('SELECT count(*) FROM jobs').fetchone()
+            self.assertTrue(Path(str(self.path) + '-wal').exists() and Path(str(self.path) + '-shm').exists())
+            self.assertEqual(ctl.logical_snapshot(self.path), before)
+        finally:
+            reader.close()
+        for change in ("UPDATE meta SET value='3' WHERE key='cursor_tg'", "UPDATE jobs SET state='sent'",
+                       'PRAGMA user_version=2'):
+            conn = sqlite3.connect(self.path)
+            try:
+                conn.execute(change)
+                conn.commit()
+            finally:
+                conn.close()
+            after = ctl.logical_snapshot(self.path)
+            self.assertNotEqual(after, before, change)
+            before = after
+
     def test_recover_is_idempotent_and_keeps_every_state(self):
         store = self.open()
         store.accept('tg', [tg(i) for i in range(1, 7)], 7, '-100', '99')

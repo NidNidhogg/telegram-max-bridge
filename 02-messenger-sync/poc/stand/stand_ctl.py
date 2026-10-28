@@ -524,10 +524,25 @@ def step_d3_other_direction():
     print('D3 multipart OK: the uncertain part blocks only its direction')
 
 
-def step_d3_hash():
+def logical_snapshot(path):
+    """Digest of user_version, schema and every row in one read transaction.
+
+    WAL/SHM sidecar files and checkpoints may change on a normal read; the data may not."""
     import hashlib
-    names = sorted(p.name for p in STATE.iterdir() if p.name.startswith('bridge.sqlite3') and '.bak' not in p.name)
-    print(' '.join(f'{n}:{hashlib.sha256((STATE / n).read_bytes()).hexdigest()[:16]}' for n in names))
+    conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+    try:
+        conn.execute('BEGIN')
+        digest = hashlib.sha256(b'user_version=%d\n' % conn.execute('PRAGMA user_version').fetchone()[0])
+        for line in conn.iterdump():
+            digest.update(line.encode() + b'\n')
+        conn.rollback()
+    finally:
+        conn.close()
+    return digest.hexdigest()[:16]
+
+
+def step_d3_snapshot():
+    print(logical_snapshot(STATE / 'bridge.sqlite3'))
 
 
 def step_d3_confirm_reply():
