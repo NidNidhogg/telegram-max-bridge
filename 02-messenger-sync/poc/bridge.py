@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import contextmanager
 import contextvars
 import email.utils
 import fcntl
@@ -13,7 +12,6 @@ import json
 import math
 import mimetypes
 import os
-from pathlib import Path
 import random
 import re
 import secrets
@@ -23,8 +21,11 @@ import ssl
 import sys
 import time
 import urllib.parse
+from contextlib import contextmanager
+from pathlib import Path
 
 import aiohttp
+import storage
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = ROOT / '.env'
@@ -47,7 +48,7 @@ SAFE_VALUE = re.compile(r'[A-Za-z0-9_.:>-]{1,64}')
 RUN = {'id': None, 'component': None}
 ERROR_CODES = frozenset({'tls_failed', 'attachment_not_ready', 'server_error', 'rate_limited', 'auth_rejected',
                          'poll_conflict', 'api_rejected', 'connect_failed', 'transport_error', 'bridge_error',
-                         'storage_error', 'internal_error', 'cancelled', 'bad_response', 'interrupted'})
+                         'storage_error', 'storage_pressure', 'internal_error', 'cancelled', 'bad_response', 'interrupted'})
 WORKERS = ('poll:tg', 'poll:max', 'send:tg', 'send:max')
 RECOVERY_CONFIRMATIONS = 2
 # Progress entry of the worker running in the current task; every HTTP request extends its deadline.
@@ -244,8 +245,8 @@ CONFIG_KEYS = ('TG_BOT_TOKEN', 'MAX_BOT_TOKEN', 'TG_BOT_USERNAME', 'MAX_BOT_USER
                'MAX_CA_FILE', 'TG_CHAT_ID', 'MAX_CHAT_ID')
 
 
-def config(require_chats=False, environ=None, env_file=None):
-    """Read the local .env, then let process environment variables override it."""
+def config_values(keys, environ=None, env_file=None):
+    """Read local .env and override only the requested keys from the process environment."""
     environ = os.environ if environ is None else environ
     env_file = ENV if env_file is None else env_file
     values = {}
@@ -255,9 +256,21 @@ def config(require_chats=False, environ=None, env_file=None):
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
                 values[key.strip()] = value.strip().strip('\"\'')
-    for key in CONFIG_KEYS:
+    for key in keys:
         if key in environ:
             values[key] = environ[key].strip()
+    return values
+
+
+def storage_settings(environ=None, env_file=None):
+    try:
+        return storage.Settings.load(config_values(storage.DEFAULTS, environ, env_file))
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from None
+
+
+def config(require_chats=False, environ=None, env_file=None):
+    values = config_values(CONFIG_KEYS, environ, env_file)
     for key in ('TG_BOT_TOKEN', 'MAX_BOT_TOKEN'):
         if not values.get(key):
             raise BridgeError(f'Не задан {key}: укажите переменную окружения или строку в локальном .env')
@@ -1013,6 +1026,11 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                 return
             delay = poll_interval
             worker = 'poll:' + platform
+            gate = getattr(bridge, 'storage_gate', None)
+            if gate is not None and not gate.allow_poll():
+                bridge.phase(worker, 'storage_wait', time.time() + gate.policy.check_interval, reason='storage_pressure')
+                await wait(gate.policy.check_interval)
+                continue
             bridge.phase(worker, 'poll', time.time() + bridge.budgets['poll'])
             try:
                 await bridge.poll(platform)
@@ -1202,7 +1220,7 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
     now = time.time() if now is None else now
     result = {'ok': False, 'generated_at': now, 'schema_version': None,
               'thresholds': {'stale_after_seconds': stale_after, 'queue_age_seconds': queue_age},
-              'runtime': {}, 'platforms': {}, 'issues': []}
+              'runtime': {}, 'platforms': {}, 'issues': [], 'warnings': [], 'storage': {}}
     issues = result['issues']
 
     def issue(key, code, **details):
@@ -1326,22 +1344,28 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
     return result
 
 
-def read_health(state, stale_after=180, queue_age=300):
+def read_health(state, stale_after=180, queue_age=300, storage_policy=None):
     path = state / 'bridge.sqlite3'
-    if not path.exists():
-        return health_snapshot(None, stale_after=stale_after, queue_age=queue_age)
     store = None
     try:
-        store = Store(path, readonly=True)
-        store.db.execute('BEGIN')
-        return health_snapshot(store, running=bridge_running(state), stale_after=stale_after, queue_age=queue_age)
+        if not path.exists():
+            result = health_snapshot(None, stale_after=stale_after, queue_age=queue_age)
+        else:
+            store = Store(path, readonly=True)
+            store.db.execute('BEGIN')
+            result = health_snapshot(store, running=bridge_running(state), stale_after=stale_after, queue_age=queue_age)
     except (OSError, sqlite3.Error, BridgeError):
         result = health_snapshot(None, stale_after=stale_after, queue_age=queue_age)
         result['issues'] = [{'key': 'state', 'code': 'state_unavailable'}]
-        return result
     finally:
         if store is not None:
             store.db.close()
+    result['storage'] = storage.snapshot(state, storage_policy or storage_settings())
+    result['issues'].extend(result['storage']['issues'])
+    result['warnings'].extend(result['storage']['warnings'])
+    result['storage']['intake_paused'] = any(w.get('phase') == 'storage_wait' for w in result.get('workers', {}).values())
+    result['ok'] = not result['issues']
+    return result
 
 
 def print_health(snapshot):
@@ -1358,8 +1382,13 @@ def print_health(snapshot):
         head = data['delivery']['head']
         if head:
             print(f"{platform}: head job={head['id']} part={head['part']} state={head['state']} reason={head['reason']} wait={head['wait']} retry_at={head['retry_at']}")
+    if snapshot.get('storage'):
+        disk = snapshot['storage']
+        print(f"storage={disk['state']} managed_bytes={disk['managed_bytes']} free_bytes={disk['free_bytes']} intake_paused={disk['intake_paused']}")
     for issue in snapshot['issues']:
         print('issue ' + json.dumps(issue, ensure_ascii=False, sort_keys=True))
+    for warning in snapshot.get('warnings', []):
+        print('warning ' + json.dumps(warning, ensure_ascii=False, sort_keys=True))
 
 
 class AlertMonitor:
@@ -1375,7 +1404,7 @@ class AlertMonitor:
         ''')
 
     def observe(self, snapshot):
-        current = {entry['key']: entry for entry in snapshot['issues']}
+        current = {entry['key']: entry for entry in snapshot['issues'] + snapshot.get('warnings', [])}
         with self.db:
             row = self.db.execute("SELECT value FROM monitor_state WHERE key='issues'").fetchone()
             previous = json.loads(row[0]) if row else {}
@@ -1386,6 +1415,8 @@ class AlertMonitor:
                 current = {**previous, **current}
             assessed = snapshot.get('workers') or {}
             for key, entry in previous.items():
+                if key.startswith('storage:') and snapshot.get('storage', {}).get('state') == 'unknown':
+                    current.setdefault(key, entry)
                 # A worker that could not be observed (stale heartbeat, stopped process) has not recovered.
                 worker = key[len('worker:'):] if key.startswith('worker:') else (
                     'poll:' + key[len('paused:'):] if key.startswith('paused:') else None)
@@ -1411,7 +1442,7 @@ class AlertMonitor:
     def alert(self, kind, moment, entry):
         # alerts.jsonl keeps event_id/kind/detected_at/issue; the log fields are additive.
         alert = {'event_id': secrets.token_hex(16), 'kind': kind, 'detected_at': moment, 'issue': entry,
-                 'timestamp': utc(moment), 'level': 'error' if kind == 'problem' else 'info',
+                 'timestamp': utc(moment), 'level': ('warning' if entry.get('severity') == 'warning' else 'error') if kind == 'problem' else 'info',
                  'component': 'monitor', 'event': 'alert_' + kind, 'run_id': RUN['id']}
         self.db.execute('INSERT INTO alerts(event_id,payload) VALUES(?,?)',
                         (alert['event_id'], json.dumps(alert, ensure_ascii=False, sort_keys=True)))
@@ -1427,14 +1458,10 @@ class AlertMonitor:
 
 
 def emit_alert(alert, path=None):
-    line = json.dumps(alert, ensure_ascii=False, sort_keys=True)
-    if path is None:
-        print(line, flush=True)
+    if path is not None:
+        storage.AlertFile(path, storage_settings())(alert)
     else:
-        with path.open('a', encoding='utf-8') as stream:
-            stream.write(line + '\n')
-            stream.flush()
-            os.fsync(stream.fileno())
+        print(json.dumps(alert, ensure_ascii=False, sort_keys=True), flush=True)
 
 
 def monitor(state, args):
@@ -1451,9 +1478,12 @@ def monitor(state, args):
 
         previous_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
         try:
+            sink = storage.AlertFile(args.alerts_file, args.storage) if args.alerts_file else None
             while not stopping:
-                alerts.observe(read_health(state, args.stale_after, args.queue_age))
-                alerts.flush(lambda alert: emit_alert(alert, args.alerts_file))
+                alerts.observe(read_health(state, args.stale_after, args.queue_age, args.storage))
+                if sink is not None:
+                    sink.maintain()
+                alerts.flush(sink if sink is not None else emit_alert)
                 if args.once:
                     return
                 deadline = time.monotonic() + args.interval
@@ -1543,13 +1573,17 @@ def main(argv=None):
         # Long-running commands write JSON Lines; the other CLI commands keep their human/JSON output.
         RUN['component'] = 'bridge' if args.command == 'run' else 'monitor'
         RUN['id'] = secrets.token_hex(8)
+    args.storage = storage_settings() if args.command in ('run', 'monitor', 'status', 'health') else None
     state = args.state_dir
+    if (args.alerts_file is not None and
+            (args.alerts_file.name != 'alerts.jsonl' or args.alerts_file.parent.resolve() != state.resolve())):
+        raise BridgeError('--alerts-file должен указывать на alerts.jsonl в выбранном --state-dir')
     db_path = state / 'bridge.sqlite3'
     if args.command == 'monitor':
         monitor(state, args)
         return
     if args.command in ('status', 'health'):
-        snapshot = read_health(state, args.stale_after, args.queue_age)
+        snapshot = read_health(state, args.stale_after, args.queue_age, args.storage)
         if args.json:
             print(json.dumps(snapshot, ensure_ascii=False, indent=2))
         else:
@@ -1612,6 +1646,7 @@ async def network_command(args, state, db_path):
                 store.set('identity', identity)
             store.recover()
             bridge = Bridge(cfg, api, store, ids)
+            bridge.storage_gate = storage.Gate(state, getattr(args, 'storage', None) or storage.Settings())
             await run_bridge(bridge)
             log('info', 'bridge_stopped', message='Остановлено. Очередь сохранена.')
 

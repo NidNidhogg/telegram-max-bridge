@@ -6,11 +6,20 @@ x-bridge: &bridge
   user: "10001:10001"
   read_only: true
   tmpfs:
-    - /tmp
+    - /tmp:size=${BRIDGE_TMPFS_SIZE:-64m},mode=1777
   cap_drop:
     - ALL
   security_opt:
     - no-new-privileges:true
+  environment:
+    STORAGE_WARN_BYTES: ${STORAGE_WARN_BYTES-268435456}
+    STORAGE_CRITICAL_BYTES: ${STORAGE_CRITICAL_BYTES-536870912}
+    STORAGE_FREE_WARN_BYTES: ${STORAGE_FREE_WARN_BYTES-268435456}
+    STORAGE_FREE_CRITICAL_BYTES: ${STORAGE_FREE_CRITICAL_BYTES-134217728}
+    STORAGE_CHECK_INTERVAL: ${STORAGE_CHECK_INTERVAL-5}
+    ALERTS_MAX_BYTES: ${ALERTS_MAX_BYTES-10485760}
+    ALERTS_BACKUP_COUNT: ${ALERTS_BACKUP_COUNT-4}
+    ALERTS_RETENTION_DAYS: ${ALERTS_RETENTION_DAYS-90}
   env_file:
     - path: 02-messenger-sync/.env
       required: false
@@ -52,8 +61,12 @@ services:
     <<: *bridge
     profiles: ["tools"]
     restart: "no"
-    env_file: !reset []
-    volumes: !reset []
+    env_file: []
+    # Unit fixtures use /tmp (64 MiB), not the production state volume.
+    environment:
+      STORAGE_FREE_WARN_BYTES: "2"
+      STORAGE_FREE_CRITICAL_BYTES: "1"
+    volumes: []
     network_mode: none
     entrypoint: ["python", "-m", "unittest", "discover", "-s", "/app/02-messenger-sync/poc", "-p", "test_*.py"]
     command: []
@@ -62,8 +75,11 @@ services:
     <<: *bridge
     profiles: ["tools"]
     restart: "no"
-    env_file: !reset []
-    volumes: !reset []
+    env_file: []
+    environment:
+      STORAGE_FREE_WARN_BYTES: "2"
+      STORAGE_FREE_CRITICAL_BYTES: "1"
+    volumes: []
     network_mode: none
     entrypoint: ["sh", "-ec", "python smoke_p0.py && python smoke_async.py"]
     command: []
