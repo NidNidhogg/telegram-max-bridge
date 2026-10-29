@@ -613,8 +613,9 @@ def step_d4_recovered(worker):
     print(f'D4 recovered OK: {worker} healthy in the new container; exactly one problem and one recovery event')
 
 LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia')
+# Events the stand scenarios produce; delivery_failed (TLS, 4xx) is covered by test_async only.
 LOG_EVENTS = ('preflight_ok', 'bridge_started', 'bridge_stopped', 'delivery_sent', 'delivery_retry_scheduled',
-              'delivery_failed', 'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
+              'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
 
 
 def check_logs(lines, required=()):

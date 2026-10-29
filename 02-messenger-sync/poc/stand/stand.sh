@@ -130,6 +130,7 @@ health_is healthy
 
 step 'state volume survives make down / make up'
 before=$(ctl snapshot)
+keep_logs
 $M COMPOSE="$C" down
 docker volume inspect "${PROJECT}_state" >/dev/null
 $M COMPOSE="$C" up
@@ -140,6 +141,7 @@ ctl reply-after-restart
 
 step 'make update keeps state; failed build does not stop the working version'
 before=$(ctl snapshot)
+keep_logs
 $M COMPOSE="$C" update
 [ "$before" = "$(ctl snapshot)" ]
 old=$(cid)
