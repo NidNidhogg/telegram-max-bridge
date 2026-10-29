@@ -58,7 +58,8 @@ def touch():
     current = WORKER.get()
     if current is not None:
         entry, budget = current
-        entry['until'] = max(entry['until'] or 0, time.time() + budget)
+        entry['progress_at'] = time.time()
+        entry['until'] = max(entry['until'] or 0, entry['progress_at'] + budget)
 
 
 def server_failure(exc):
@@ -864,9 +865,21 @@ class Bridge:
         self.budgets = {'poll': total + 5, 'deliver': total + 5}
 
     def phase(self, worker, phase, until=None, reason=None):
-        entry = {'phase': phase, 'since': time.time(), 'until': until, 'reason': reason}
+        now = time.time()
+        entry = {'phase': phase, 'since': now, 'until': until, 'reason': reason, 'progress_at': now}
         self.workers[worker] = entry
         WORKER.set((entry, self.budgets[phase]) if phase in self.budgets else None)
+
+    def resumed(self, last, now, interval):
+        """The event loop was frozen between two heartbeats (SIGSTOP, host suspend)."""
+        # Frozen time does not count against a deadline that lived through the freeze, so a healthy worker
+        # is not stalled on resume and a hung one stays stalled. The gap is > 2*interval + 1 s, so progress
+        # before the midpoint preceded the freeze; later progress (a worker that ran before this heartbeat)
+        # already has a fresh budget.
+        boundary = (last + now) / 2
+        for entry in self.workers.values():
+            if entry['until'] is not None and entry['progress_at'] < boundary:
+                entry['until'] += now - last - interval
 
     async def poll(self, platform):
         try:
@@ -1039,12 +1052,8 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
         last = None
         while not stop.is_set():
             now = time.time()
-            # A frozen loop (SIGSTOP, host suspend) ran no worker: the frozen time is not counted against
-            # any deadline, so a healthy worker is not stalled on resume and a hung one stays stalled.
             if last is not None and now - last > 2 * heartbeat_interval + 1:
-                for entry in bridge.workers.values():
-                    if entry['until'] is not None:
-                        entry['until'] += now - last - heartbeat_interval
+                bridge.resumed(last, now, heartbeat_interval)
             last = now
             bridge.store.heartbeat(bridge.workers)
             await wait(heartbeat_interval)

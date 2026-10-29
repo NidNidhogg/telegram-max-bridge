@@ -989,6 +989,48 @@ class RuntimeTests(HttpServer):
                 await asyncio.sleep(0.05)
         self.assertEqual(observe(), ['problem', 'recovery'])
 
+    async def test_phase_started_after_resume_keeps_its_own_budget(self):
+        # F9: a worker may run before the heartbeat after SIGCONT; its new deadline is not shifted by the freeze.
+        release, resumed = asyncio.Event(), {}
+        real_deliver = self.bridge.deliver
+
+        async def deliver(destination, stop=None):
+            if destination == 'max' and not resumed:
+                await asyncio.sleep(0.1)
+                time.sleep(1.2)
+                resumed['at'] = time.time()
+                # The next delivery phase starts in the same task, before the heartbeat can run.
+                self.bridge.phase('send:max', 'deliver', time.time() + self.bridge.budgets['deliver'])
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        def stalled():
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.3)
+            return snapshot['runtime']['heartbeat_at'] > resumed['at'] and any(
+                i.get('worker') == 'send:max' for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+
+        self.bridge.deliver = deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: resumed)
+            await self.until(stalled, 2)
+            detected = time.time() - resumed['at']
+            release.set()
+        self.assertLess(detected, 0.05 + 0.3 + 0.4)
+
+    async def test_resume_shifts_only_deadlines_that_lived_through_the_freeze(self):
+        self.bridge.workers = {
+            'send:max': {'phase': 'deliver', 'since': 100, 'until': 105, 'progress_at': 100, 'reason': None},
+            'send:tg': {'phase': 'deliver', 'since': 119, 'until': 125, 'progress_at': 119, 'reason': None},
+            'poll:tg': {'phase': 'poll', 'since': 100, 'until': 150, 'progress_at': 119.5, 'reason': None},
+            'poll:max': {'phase': 'paused', 'since': 100, 'until': None, 'progress_at': 100, 'reason': None}}
+        self.bridge.resumed(last=101, now=120, interval=2)
+        self.assertEqual({k: v['until'] for k, v in self.bridge.workers.items()},
+                         {'send:max': 122, 'send:tg': 125, 'poll:tg': 150, 'poll:max': None})
+        self.assertEqual(self.bridge.workers['send:max']['since'], 100)
+
     async def test_untrusted_api_code_does_not_stop_the_bridge(self):
         def handle(request, body):
             if request.path == '/getUpdates':
