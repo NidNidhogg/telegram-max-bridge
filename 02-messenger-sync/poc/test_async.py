@@ -949,7 +949,45 @@ class RuntimeTests(HttpServer):
             beats = self.store.get('heartbeat')
             await self.until(lambda: self.store.get('heartbeat') != beats)
         self.assertEqual(seen, set())
-        self.assertIsNotNone(json.loads(self.store.get('workers')).get('resumed_at'))
+
+    async def test_known_stall_is_not_recovered_by_resuming_a_frozen_loop(self):
+        # F2 x F7: SIGCONT of the whole process does not confirm progress of a worker that was already hung.
+        release = asyncio.Event()
+        real_deliver = self.bridge.deliver
+
+        async def deliver(destination, stop=None):
+            if destination == 'max':
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        self.bridge.deliver = deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        monitor = b.AlertMonitor(':memory:')
+        self.addCleanup(monitor.db.close)
+        emitted = []
+
+        def observe():
+            monitor.observe(b.health_snapshot(self.store, running=True, stale_after=0.3))
+            monitor.flush(emitted.append)
+            return [a['kind'] for a in emitted if a['issue'].get('worker') == 'send:max']
+
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: observe() == ['problem'])
+            time.sleep(1.2)
+            beats = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != beats)
+            for _ in range(8):
+                observe()
+                await asyncio.sleep(0.1)
+            self.assertEqual(observe(), ['problem'])
+            release.set()
+            await self.until(lambda: observe() == ['problem', 'recovery'])
+            for _ in range(3):
+                observe()
+                await asyncio.sleep(0.05)
+        self.assertEqual(observe(), ['problem', 'recovery'])
 
     async def test_untrusted_api_code_does_not_stop_the_bridge(self):
         def handle(request, body):
