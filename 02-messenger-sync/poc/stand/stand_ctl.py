@@ -655,7 +655,7 @@ def step_d4_logs():
 def step_d5_thresholds():
     disk = os.statvfs(STATE)
     free = disk.f_bavail * disk.f_frsize
-    assert free > 256 * 1024**2, 'D5 stand needs >256 MiB free to reserve and release 64 MiB safely'
+    assert free > 96 * 1024**2, 'D5 pressure filesystem needs >96 MiB free to reserve and release 64 MiB safely'
     print(free - 16 * 1024**2, free - 32 * 1024**2)
 
 

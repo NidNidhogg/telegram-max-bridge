@@ -1,0 +1,28 @@
+# Only the D5 storage-pressure scenario: a shared filesystem with deterministic capacity.
+services:
+  bridge:
+    volumes:
+      - pressure_state:/state
+  monitor:
+    volumes:
+      - pressure_state:/state
+  ctl:
+    volumes:
+      - pressure_state:/state
+  mockapi:
+    volumes:
+      - pressure_mockdata:/state
+      # Keep the temporary filesystem mounted while bridge/monitor are recreated.
+      - pressure_state:/hold-state:ro
+volumes:
+  pressure_state:
+    labels:
+      telegram-max-bridge.stand: "1"
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=128m,uid=10001,gid=10001,mode=0700"
+  pressure_mockdata:
+    labels:
+      telegram-max-bridge.stand: "1"
