@@ -19,8 +19,10 @@ for kind in 'ps -aq' 'volume ls -q'; do
     [ "$all" = "$own" ] || refuse "project '$PROJECT' has resources not created by the stand"
 done
 export BRIDGE_IMAGE=${STAND_IMAGE:-telegram-max-bridge:stand}
+export BRIDGE_TMPFS_SIZE=64m
 export HEALTH_STALE_AFTER=6 HEALTH_QUEUE_AGE=8 HEALTH_INTERVAL=1s HEALTH_START_PERIOD=5s
 C="docker compose -p $PROJECT -f compose.yaml -f 02-messenger-sync/poc/stand/compose.stand.yaml"
+P="$C -f 02-messenger-sync/poc/stand/compose.storage.yaml"
 M="make --no-print-directory PROJECT=$PROJECT"
 BROKEN=$(mktemp)
 LOGS=$(mktemp)
@@ -32,7 +34,10 @@ ctl() { $C run --rm --no-deps -T ctl "$@"; }
 cid() { $C ps -aq bridge; }
 cleanup() {
     rm -f "$BROKEN" "$LOGS"
-    [ "${KEEP_STAND:-0}" = 1 ] || $C --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
+    if [ "${KEEP_STAND:-0}" != 1 ]; then
+        $P --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
+        $C --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 health_is() {
@@ -56,6 +61,7 @@ stop_bridge() {
     echo "stop OK: SIGTERM handled, waited ${took}s for the in-flight request, exit code 0"
 }
 
+$P --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
 $C --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
 step 'build stand image and start bridge, monitor, mock API'
 $C build bridge
@@ -313,6 +319,50 @@ for worker in poll:tg send:max poll:max send:tg; do
     fresh
     ctl d4-recovered "$worker"
 done
+
+step 'D5.1: bounded alert JSON files and outbox recovery after a real SIGKILL'
+ctl d5-rotation
+
+step 'D5.1: /tmp is a real 64 MiB tmpfs in bridge and monitor'
+for service in bridge monitor; do
+    $C exec -T "$service" python - <<'PY'
+import errno, os
+from pathlib import Path
+p = Path('/tmp/d5-owned-fill')
+assert not p.exists()
+fs = os.statvfs('/tmp')
+assert fs.f_blocks * fs.f_frsize == 64 * 1024**2
+try:
+    with p.open('xb') as stream:
+        while True:
+            stream.write(b'x' * 1024**2)
+except OSError as exc:
+    assert exc.errno == errno.ENOSPC, exc.errno
+else:
+    raise AssertionError('tmpfs did not enforce its limit')
+finally:
+    p.unlink()
+print('tmpfs OK: 64 MiB, enforced ENOSPC, fixture removed')
+PY
+done
+
+step 'D5.1: real bounded state-filesystem pressure pauses intake and automatically recovers'
+# D1-D4 used normal persistent disk volumes. This final scenario gets a separate bounded
+# filesystem in the same project; mockapi holds it mounted across bridge/monitor recreation.
+keep_logs
+$M COMPOSE="$C" down
+export STAND_STORAGE_FREE_WARN_BYTES=2097152 STAND_STORAGE_FREE_CRITICAL_BYTES=1048576
+$P up -d --wait --wait-timeout 120 mockapi bridge monitor
+$P run --rm --no-deps -T ctl flows
+set -- $($P run --rm --no-deps -T ctl d5-thresholds)
+export STAND_STORAGE_FREE_WARN_BYTES=$1 STAND_STORAGE_FREE_CRITICAL_BYTES=$2
+keep_logs; $P up -d --force-recreate --no-deps bridge monitor
+$P run --rm --no-deps -T ctl d5-pressure
+keep_logs
+$M COMPOSE="$P" down
+unset STAND_STORAGE_FREE_WARN_BYTES STAND_STORAGE_FREE_CRITICAL_BYTES
+$C up -d mockapi bridge monitor
+ctl d3-health-only input_quarantine
 
 step 'D4: bridge and monitor logs are JSON Lines without tokens, texts or author names'
 keep_logs

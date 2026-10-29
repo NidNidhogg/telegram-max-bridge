@@ -49,3 +49,19 @@ done
 if fake_make cli PROJECT=work ARGS=; then fail 'make cli without ARGS succeeded'; fi
 [ ! -s "$tmp/log" ] || fail 'make cli without ARGS called docker'
 echo 'make cli OK: quoted arguments passed intact, empty ARGS refused without docker'
+
+# Compose resolves env_file differently inside YAML anchors and file overrides. Exercise the
+# actual parser with synthetic values; config does not start containers or contact the daemon.
+if command -v docker >/dev/null 2>&1; then
+    mkdir -p "$tmp/02-messenger-sync"
+    cp compose.yaml "$tmp/compose.yaml"
+    cp 02-messenger-sync/poc/stand/compose.stand.yaml "$tmp/stand.yaml"
+    printf 'TG_BOT_TOKEN=synthetic-isolation-probe\nMAX_CA_FILE=synthetic-isolation-probe\nPROBE_PRIVATE_EXTRA=synthetic-isolation-probe\n' >"$tmp/02-messenger-sync/.env"
+    docker compose --env-file "$tmp/02-messenger-sync/.env" --profile tools -f "$tmp/compose.yaml" \
+        config --format json test smoke >"$tmp/tools.json"
+    ! grep -q synthetic-isolation-probe "$tmp/tools.json" || fail 'tools inherited a private env_file'
+    HEALTH_STALE_AFTER=6 HEALTH_QUEUE_AGE=8 docker compose --profile tools --profile stand \
+        -f "$tmp/compose.yaml" -f "$tmp/stand.yaml" config --format json >"$tmp/stand.json"
+    ! grep -q synthetic-isolation-probe "$tmp/stand.json" || fail 'stand inherited a private env_file'
+    echo 'compose isolation OK: tools and stand do not inherit the synthetic private env_file'
+fi

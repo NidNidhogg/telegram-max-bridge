@@ -1,5 +1,5 @@
 PROJECT ?= telegram-max-bridge
-COMPOSE ?= docker compose -p $(PROJECT)
+COMPOSE ?= docker compose -p $(PROJECT) $(if $(wildcard 02-messenger-sync/.env),--env-file 02-messenger-sync/.env)
 WAIT_TIMEOUT ?= 180
 TAIL ?= 200
 DISCOVER_SECONDS ?= 90

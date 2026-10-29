@@ -652,5 +652,72 @@ def step_d4_logs():
     print(f'logs OK: {len(records)} JSON records from {len(runs)} runs, no synthetic tokens, texts, names or URLs')
 
 
+def step_d5_thresholds():
+    disk = os.statvfs(STATE)
+    free = disk.f_bavail * disk.f_frsize
+    assert free > 96 * 1024**2, 'D5 pressure filesystem needs >96 MiB free to reserve and release 64 MiB safely'
+    print(free - 16 * 1024**2, free - 32 * 1024**2)
+
+
+def step_d5_pressure():
+    pressure = STATE / 'd5-owned-disk-pressure.bin'
+    assert not pressure.exists(), 'refuse to overwrite an existing stand fixture'
+
+    def disk_events(kind):
+        conn = sqlite3.connect(f'file:{STATE / "monitor.sqlite3"}?mode=ro', uri=True)
+        try:
+            values = [json.loads(r[0]) for r in conn.execute('SELECT payload FROM alerts WHERE delivered=1')]
+            return [v for v in values if v['kind'] == kind and v['issue']['key'] == 'storage:free'
+                    and v['issue'].get('severity') == 'critical']
+        finally:
+            conn.close()
+
+    def paused():
+        view, issues = health_issues()
+        return (any(i['code'] == 'storage_free' for i in issues)
+                and all(view['workers'].get('poll:' + p, {}).get('phase') == 'storage_wait' for p in ('tg', 'max')))
+
+    until(lambda: all('poll:' + p in health_issues()[0]['workers'] for p in ('tg', 'max')), 'new pollers ready')
+    try:
+        # Allocated bytes on the real state volume, not a sparse file or a stubbed disk measurement.
+        with pressure.open('xb') as stream:
+            for _ in range(64):
+                stream.write(b'x' * 1024**2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        until(paused, 'storage critical and both pollers paused', 30)
+        until(lambda: len(disk_events('problem')) == 1, 'one disk problem')
+        before = snapshot_data()
+        heartbeat = health_issues()[0]['runtime']['heartbeat_at']
+        polls = call('state')['polls']
+        inject('tg', tg_event(9001, 'd5-storage-tg', reply_to=pub('stand-m1')['remote_id']))
+        inject('max', max_event('d5storage', 'd5-storage-max', reply_to=pub('stand-t1')['remote_id']))
+        time.sleep(3)
+        assert paused()
+        assert call('state')['polls'] == polls, 'poll requests continued during storage pressure'
+        assert snapshot_data() == before, 'queue or publications changed during intake pause'
+        assert health_issues()[0]['runtime']['heartbeat_at'] > heartbeat, 'heartbeat stopped'
+        assert len(disk_events('problem')) == 1 and not disk_events('recovery')
+    finally:
+        pressure.unlink(missing_ok=True)
+    until(lambda: pubs('d5-storage-tg') and pubs('d5-storage-max'), 'automatic resume and delivery', 30)
+    until(lambda: len(disk_events('recovery')) == 1, 'confirmed storage recovery', 30)
+    assert len(disk_events('problem')) == len(disk_events('recovery')) == 1
+    assert pub('d5-storage-tg')['reply'] == 'm1'
+    assert pub('d5-storage-max')['reply'] == 1
+    assert job('tg', 9001)['state'] == job('max', 'd5storage')['state'] == 'sent'
+    print('D5 storage OK: real 64 MiB pressure, paused intake, live heartbeat, automatic resume, replies, one problem/recovery')
+
+
+def step_d5_rotation():
+    # Reuse production sink/outbox regression tests inside an isolated container. Includes real SIGKILL.
+    import unittest
+
+    from test_storage import RotationTests
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(RotationTests))
+    assert result.wasSuccessful(), 'D5 rotation regression failed'
+    print('D5 rotation OK: bounded JSON files, expiration, safe paths, partial-line repair, durable outbox and real SIGKILL')
+
+
 if __name__ == '__main__':
     globals()['step_' + sys.argv[1].replace('-', '_')](*sys.argv[2:])
