@@ -292,12 +292,43 @@ owner.run()
             self.maintain()
         original = list(self.db.execute('SELECT id,mid,remote_id FROM jobs'))
         old_pages = r.metrics(self.db)['pages']
+        old_bytes = (self.state / 'bridge.sqlite3').stat().st_size
         with patch.object(b, 'ENV', self.state / 'absent.env'), patch.dict(os.environ, {'STORAGE_FREE_CRITICAL_BYTES': '1'}), redirect_stdout(io.StringIO()):
             self.assertEqual(b.main(['maintenance', '--apply', '--compact', '--state-dir', str(self.state)]), 0)
         self.assertLess(r.metrics(self.db)['pages'], old_pages)
+        self.assertLess((self.state / 'bridge.sqlite3').stat().st_size, old_bytes)
         self.assertEqual(list(self.db.execute('SELECT id,mid,remote_id FROM jobs')), original)
         print('D5.2 storage measurements: ' + json.dumps({'after_cleanup': before, 'before_reuse': reuse_before,
-              'after_reuse': reuse_after, 'after_compact': r.metrics(self.db)}, sort_keys=True))
+              'after_reuse': reuse_after, 'after_compact': r.metrics(self.db), 'physical_before': old_bytes,
+              'physical_after': (self.state / 'bridge.sqlite3').stat().st_size}, sort_keys=True))
+
+    def test_compact_reports_deferred_if_a_reader_appears_before_final_checkpoint(self):
+        self.seed(text='я' * 10000)
+        real_checkpoint = r.checkpoint
+        readers = []
+
+        def with_reader(db, *, truncate=False):
+            if truncate:
+                reader = sqlite3.connect(self.state / 'bridge.sqlite3')
+                readers.append(reader)
+                reader.execute('BEGIN')
+                reader.execute('SELECT * FROM jobs').fetchone()
+            return real_checkpoint(db, truncate=truncate)
+
+        try:
+            with (patch.object(b, 'ENV', self.state / 'absent.env'),
+                  patch.dict(os.environ, {'STORAGE_FREE_CRITICAL_BYTES': '1'}),
+                  patch.object(r, 'checkpoint', with_reader), redirect_stdout(io.StringIO()) as output):
+                code = b.main(['maintenance', '--apply', '--compact', '--state-dir', str(self.state)])
+            self.assertEqual(code, 1)
+            result = json.loads(output.getvalue())['databases']['bridge']
+            self.assertTrue(result['compacted'])
+            self.assertEqual(result['checkpoint']['state'], 'deferred')
+            self.assertEqual(result['checkpoint']['mode'], 'TRUNCATE')
+        finally:
+            for reader in readers:
+                reader.close()
+        self.assertEqual(real_checkpoint(self.db, truncate=True)['state'], 'ok')
 
 
 class MonitorRetentionTests(unittest.TestCase):

@@ -250,7 +250,13 @@ class Maintainer:
                         (json.dumps(result, sort_keys=True),))
 
 
-def checkpoint(db):
-    """Called by the existing writer only; PASSIVE never waits for a long reader."""
-    busy, frames, copied = db.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
-    return {'state': 'deferred' if busy or copied < frames else 'ok', 'frames': frames, 'copied': copied}
+def checkpoint(db, *, truncate=False):
+    """The existing owner only; offline TRUNCATE reports active readers without waiting."""
+    mode = 'TRUNCATE' if truncate else 'PASSIVE'
+    previous = db.execute('PRAGMA busy_timeout').fetchone()[0]
+    db.execute('PRAGMA busy_timeout=0')
+    try:
+        busy, frames, copied = db.execute(f'PRAGMA wal_checkpoint({mode})').fetchone()
+    finally:
+        db.execute(f'PRAGMA busy_timeout={previous}')
+    return {'state': 'deferred' if busy or copied < frames else 'ok', 'frames': frames, 'copied': copied, 'mode': mode}

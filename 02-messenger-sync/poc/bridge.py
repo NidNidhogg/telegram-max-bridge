@@ -1653,6 +1653,8 @@ def maintenance_command(state, args):
                         with retention.bounded(db, remaining_ms, lambda: stopping):
                             db.execute('VACUUM')
                         result['compacted'] = True
+                        if not stopping:
+                            result['checkpoint'] = retention.checkpoint(db, truncate=True)
                         result['space'] = retention.metrics(db)
                     output['databases'][kind] = result
         finally:
