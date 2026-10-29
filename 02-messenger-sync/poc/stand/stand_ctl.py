@@ -612,7 +612,7 @@ def step_d4_recovered(worker):
     assert len(alerts('problem', worker)) == 1 and len(alerts('recovery', worker)) == 1, worker
     print(f'D4 recovered OK: {worker} healthy in the new container; exactly one problem and one recovery event')
 
-LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia')
+LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[2345]-|d52-|mockapi|tgfile|maxmedia')
 # Events the stand scenarios produce; delivery_failed (TLS, 4xx) is covered by test_async only.
 LOG_EVENTS = ('preflight_ok', 'bridge_started', 'bridge_stopped', 'delivery_sent', 'delivery_retry_scheduled',
               'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
@@ -717,6 +717,82 @@ def step_d5_rotation():
     result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(RotationTests))
     assert result.wasSuccessful(), 'D5 rotation regression failed'
     print('D5 rotation OK: bounded JSON files, expiration, safe paths, partial-line repair, durable outbox and real SIGKILL')
+
+
+def step_d52_seed():
+    assert not b.bridge_running(STATE), 'stop the bridge before preparing retention fixtures'
+    path = STATE / 'stand-d52-fixture.json'
+    with b.process_lock(STATE), b.Store(STATE / 'bridge.sqlite3') as store:
+        rows = [dict(row) for row in store.db.execute("SELECT * FROM jobs WHERE (source='tg' AND mid IN ('1','2','3')) OR (source='max' AND mid IN ('m1','m2','m3')) ORDER BY id")]
+        assert len(rows) == 6 and all(row['state'] == 'sent' for row in rows)
+        originals = json.loads(path.read_text())['rows'] if path.exists() else rows
+        now = time.time()
+        with store.db:
+            for row in originals:
+                store.db.execute('UPDATE jobs SET payload=?,created=?,updated=? WHERE id=?',
+                                 (row['payload'], now - 32 * 86400, now - 31 * 86400, row['id']))
+        ids = [row['id'] for row in rows]
+        fixture = {'rows': [dict(row) for row in store.db.execute('SELECT * FROM jobs ORDER BY id') if row['id'] in ids],
+                   'publications': len(call('state')['publications'])}
+        path.write_text(json.dumps(fixture))
+    print('D5.2 fixture: six completed old text/photo/reply jobs; IDs and mappings preserved')
+
+
+def d52_check_content(expected):
+    fixture = json.loads((STATE / 'stand-d52-fixture.json').read_text())
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        count = 0
+        for original in fixture['rows']:
+            row = dict(conn.execute('SELECT * FROM jobs WHERE id=?', (original['id'],)).fetchone())
+            count += row['payload'] == b.retention.CLEARED
+            assert {k: v for k, v in row.items() if k != 'payload'} == {k: v for k, v in original.items() if k != 'payload'}
+        if expected == 'atomic':
+            assert count in (0, 6), 'partial maintenance transaction'
+        else:
+            assert count == expected, (count, expected)
+    assert len(call('state')['publications']) == fixture['publications'], 'maintenance published a duplicate'
+    return count
+
+
+def step_d52_unchanged():
+    d52_check_content(0)
+    print('D5.2 rollback OK: unfinished transaction did not clear content or change deliveries')
+
+
+def step_d52_atomic():
+    d52_check_content('atomic')
+    print('D5.2 SIGTERM OK: complete or rolled-back batch; no partial changes or publication')
+
+
+def d52_count():
+    fixture = json.loads((STATE / 'stand-d52-fixture.json').read_text())
+    with db() as conn:
+        return sum(conn.execute('SELECT payload FROM jobs WHERE id=?', (row['id'],)).fetchone()[0] == b.retention.CLEARED
+                   for row in fixture['rows'])
+
+
+def step_d52_cleaned():
+    until(lambda: d52_count() == 6, 'automatic content cleanup after restart', 30)
+    d52_check_content(6)
+    before = call('state')
+    call('replay', platform='tg')
+    call('replay', platform='max')
+    until(lambda: all(call('state')['polls'][p] >= before['polls'][p] + 3 for p in ('tg', 'max')), 'replay after retention')
+    d52_check_content(6)
+    print('D5.2 recovery OK: cleared six payloads; old IDs/reply mappings and dedup survive replay')
+
+
+def step_d52_replies():
+    inject('tg', tg_event(4001, 'd52-reply-tg', reply_to=pub('stand-m1')['remote_id']))
+    inject('max', max_event('d52reply', 'd52-reply-max', reply_to=pub('stand-t1')['remote_id']))
+    inject('tg', tg_event(4002, 'd52-identical'))
+    inject('tg', tg_event(4003, 'd52-identical'))
+    until(lambda: pubs('d52-reply-tg') and pubs('d52-reply-max') and len(pubs('d52-identical')) == 2,
+          'replies and independent identical texts after cleanup')
+    assert pub('d52-reply-tg')['reply'] == 'm1'
+    assert pub('d52-reply-max')['reply'] == 1
+    print('D5.2 replies OK: old mirrored messages map both ways; identical texts stay separate')
 
 
 if __name__ == '__main__':

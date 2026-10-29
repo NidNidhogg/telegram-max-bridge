@@ -88,6 +88,16 @@ class StandStore(RealStore):
 if MARKER and POINT != 'worker':
     b.Store = StandStore
 
+if POINT == 'maintenance':
+    real_save = b.retention.Maintainer.save
+
+    def maintenance_save(owner, result):
+        if owner.kind == 'bridge' and result['counts'].get('jobs', 0):
+            freeze()  # content updated inside the transaction, before maintenance state/COMMIT
+        return real_save(owner, result)
+
+    b.retention.Maintainer.save = maintenance_save
+
 if __name__ == '__main__':
     try:
         sys.exit(b.main() or 0)

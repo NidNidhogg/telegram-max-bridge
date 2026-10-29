@@ -2,6 +2,7 @@ PROJECT ?= telegram-max-bridge
 COMPOSE ?= docker compose -p $(PROJECT) $(if $(wildcard 02-messenger-sync/.env),--env-file 02-messenger-sync/.env)
 WAIT_TIMEOUT ?= 180
 TAIL ?= 200
+APPLY ?= 0
 DISCOVER_SECONDS ?= 90
 # One source of health thresholds for the Docker healthcheck, monitor, make health and make status.
 HEALTH_STALE_AFTER ?= 180
@@ -11,7 +12,7 @@ HEALTH_ARGS = --stale-after $(HEALTH_STALE_AFTER) --queue-age $(HEALTH_QUEUE_AGE
 STAND_PROJECT ?= $(PROJECT)-stand
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down update logs status health test smoke stand doctor discover stop-bridge cli
+.PHONY: help build up down update logs status health test smoke stand doctor discover stop-bridge cli maintenance compact
 
 help:
 	@echo 'make build   - собрать образ из uv.lock'
@@ -27,6 +28,8 @@ help:
 	@echo 'make discover - показать ID групп (bridge должен быть остановлен)'
 	@echo 'make stop-bridge - остановить только bridge перед изменяющими командами'
 	@echo "make cli ARGS='queue list' - любая команда bridge.py в выбранном проекте"
+	@echo 'make maintenance - dry-run одного пакета; APPLY=1 применяет при остановленных bridge/monitor'
+	@echo 'make compact - обслуживание и явное уплотнение при остановленных bridge/monitor'
 	@echo "Проект Compose: $(PROJECT) (переопределяется PROJECT=...)"
 
 build:
@@ -64,6 +67,14 @@ stop-bridge:
 cli:
 	$(if $(strip $(ARGS)),,$(error Укажите команду: make cli ARGS='queue list'))
 	$(COMPOSE) run --rm --no-deps -T bridge $(ARGS)
+
+maintenance:
+	$(if $(filter 1,$(words $(APPLY))),,$(error APPLY должен быть 0 или 1))
+	$(if $(filter $(APPLY),0 1),,$(error APPLY должен быть 0 или 1))
+	$(COMPOSE) run --rm --no-deps -T bridge maintenance $(if $(filter 1,$(APPLY)),--apply)
+
+compact:
+	$(COMPOSE) run --rm --no-deps -T bridge maintenance --apply --compact
 
 test: build
 	$(COMPOSE) --profile tools run --rm --no-deps -T test

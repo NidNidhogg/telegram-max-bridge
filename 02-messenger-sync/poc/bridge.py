@@ -21,10 +21,11 @@ import ssl
 import sys
 import time
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
 import aiohttp
+import retention
 import storage
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -265,6 +266,13 @@ def config_values(keys, environ=None, env_file=None):
 def storage_settings(environ=None, env_file=None):
     try:
         return storage.Settings.load(config_values(storage.DEFAULTS, environ, env_file))
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from None
+
+
+def retention_settings(environ=None, env_file=None):
+    try:
+        return retention.Settings.load(config_values(retention.DEFAULTS, environ, env_file))
     except ValueError as exc:
         raise BridgeError(str(exc)) from None
 
@@ -601,6 +609,7 @@ class Store:
         # Durability settings are explicit and verified instead of relying on build defaults.
         mode = self.db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower()
         self.db.execute('PRAGMA synchronous=FULL')
+        self.db.execute('PRAGMA journal_size_limit=4194304')
         synchronous = self.db.execute('PRAGMA synchronous').fetchone()[0]
         if mode != ('memory' if str(path) == ':memory:' else 'wal') or synchronous != 2:
             raise BridgeError('SQLite не включил WAL и synchronous=FULL; запуск остановлен, база не изменена')
@@ -668,6 +677,10 @@ class Store:
             self.set('last_poll_error_' + platform, '')
 
     def accept_one(self, platform, event, chat_id, own_id):
+        tombstone = self.db.execute('''SELECT 1 FROM quarantine WHERE platform=? AND chat=? AND event_key=?
+            AND state='resolved' AND payload=?''', (platform, str(chat_id), event_key(platform, event), retention.CLEARED)).fetchone()
+        if tombstone:
+            return
         message = normalize(platform, event, chat_id, own_id)
         if message is not None:
             # Build all parts before inserting, so validation never leaves a partial message.
@@ -1076,6 +1089,14 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
             bridge.store.heartbeat(bridge.workers)
             await wait(heartbeat_interval)
 
+    async def maintain():
+        owner = bridge.maintainer
+        while not stop.is_set():
+            result = owner.run(stopping=stop.is_set)
+            if result['state'] != 'ok' and not stop.is_set():
+                log('warning', 'maintenance_deferred', error_code='storage_error')
+            await wait(owner.policy.interval)
+
     if install_signals:
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(signum, stop.set)
@@ -1088,6 +1109,8 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                 workers = [group.create_task(poller(p), name='poll:' + p) for p in ('tg', 'max')]
                 workers += [group.create_task(sender(p), name='send:' + p) for p in ('tg', 'max')]
                 workers.append(group.create_task(heartbeat(), name='heartbeat'))
+                if getattr(bridge, 'maintainer', None) is not None:
+                    workers.append(group.create_task(maintain(), name='maintenance'))
                 await stop.wait()
                 _, pending = await asyncio.wait(workers, timeout=shutdown_timeout)
                 for task in pending:
@@ -1364,6 +1387,29 @@ def read_health(state, stale_after=180, queue_age=300, storage_policy=None):
     result['issues'].extend(result['storage']['issues'])
     result['warnings'].extend(result['storage']['warnings'])
     result['storage']['intake_paused'] = any(w.get('phase') == 'storage_wait' for w in result.get('workers', {}).values())
+    result['maintenance'] = {}
+    for kind, name in (('bridge', 'bridge.sqlite3'), ('monitor', 'monitor.sqlite3')):
+        path = state / name
+        if not path.exists():
+            continue
+        try:
+            fd = storage.directory(state)
+            try:
+                storage.file_stat(fd, name)
+                storage.file_stat(fd, name + '-wal')
+                storage.file_stat(fd, name + '-shm')
+            finally:
+                os.close(fd)
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.1)) as db:
+                db.row_factory = sqlite3.Row
+                db.execute('BEGIN')
+                report = retention.load_report(db, kind)
+                result['maintenance'][kind] = {**report, 'space': retention.metrics(db)}
+                if report.get('state') in ('error', 'deferred'):
+                    result['warnings'].append({'key': 'maintenance:' + kind, 'code': 'maintenance_deferred',
+                                               'owner': kind, 'severity': 'warning', 'reason': report.get('reason')})
+        except (OSError, sqlite3.Error, ValueError):
+            result['issues'].append({'key': 'maintenance:' + kind, 'code': 'maintenance_unavailable', 'owner': kind})
     result['ok'] = not result['issues']
     return result
 
@@ -1389,6 +1435,8 @@ def print_health(snapshot):
         print('issue ' + json.dumps(issue, ensure_ascii=False, sort_keys=True))
     for warning in snapshot.get('warnings', []):
         print('warning ' + json.dumps(warning, ensure_ascii=False, sort_keys=True))
+    for kind, report in snapshot.get('maintenance', {}).items():
+        print('maintenance ' + kind + ' ' + json.dumps(report, sort_keys=True))
 
 
 class AlertMonitor:
@@ -1398,6 +1446,8 @@ class AlertMonitor:
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=FULL;
+            PRAGMA journal_size_limit=4194304;
             CREATE TABLE IF NOT EXISTS monitor_state(key TEXT PRIMARY KEY,value TEXT);
             CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY,event_id TEXT UNIQUE,
                 payload TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
@@ -1447,12 +1497,17 @@ class AlertMonitor:
         self.db.execute('INSERT INTO alerts(event_id,payload) VALUES(?,?)',
                         (alert['event_id'], json.dumps(alert, ensure_ascii=False, sort_keys=True)))
 
-    def flush(self, sink):
+    def flush(self, sink, stopping=lambda: False):
         count = 0
-        for row in self.db.execute('SELECT id,payload FROM alerts WHERE delivered=0 ORDER BY id').fetchall():
-            sink(json.loads(row['payload']))
+        for row in self.db.execute('SELECT id,payload FROM alerts WHERE delivered=0 ORDER BY id LIMIT 100').fetchall():
+            if stopping():
+                break
+            payload = json.loads(row['payload'])
+            sink(payload)
+            payload['retention_since'] = time.time()
             with self.db:
-                self.db.execute('UPDATE alerts SET delivered=1 WHERE id=?', (row['id'],))
+                self.db.execute('UPDATE alerts SET delivered=1,payload=? WHERE id=?',
+                                (json.dumps(payload, ensure_ascii=False, sort_keys=True), row['id']))
             count += 1
         return count
 
@@ -1479,11 +1534,16 @@ def monitor(state, args):
         previous_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
         try:
             sink = storage.AlertFile(args.alerts_file, args.storage) if args.alerts_file else None
+            owner = retention.Maintainer(alerts.db, 'monitor', args.retention)
+            next_maintenance = 0
             while not stopping:
                 alerts.observe(read_health(state, args.stale_after, args.queue_age, args.storage))
-                if sink is not None:
+                if not stopping and time.monotonic() >= next_maintenance:
+                    owner.run(stopping=lambda: stopping)
+                    next_maintenance = time.monotonic() + args.retention.interval
+                if sink is not None and not stopping:
                     sink.maintain()
-                alerts.flush(sink if sink is not None else emit_alert)
+                alerts.flush(sink if sink is not None else emit_alert, stopping=lambda: stopping)
                 if args.once:
                     return
                 deadline = time.monotonic() + args.interval
@@ -1500,6 +1560,7 @@ def queue_view(store, command, action, target_id=None, limit=100):
     table = 'jobs' if command == 'queue' else 'quarantine'
     fields = ('id,source,chat,mid,destination,part,parent,state,remote_id,attempts,ready,error'
               if command == 'queue' else 'id,platform,chat,event_key,error,state,attempts,created,updated')
+    fields += f",CASE WHEN payload='{retention.CLEARED}' THEN 1 ELSE 0 END AS content_cleared"
     if not store.has_table(table):
         return []
     if action == 'list':
@@ -1521,10 +1582,89 @@ def queue_view(store, command, action, target_id=None, limit=100):
     return result
 
 
+def maintenance_command(state, args):
+    """Offline CLI: dry-run opens read-only; apply owns both existing writer locks."""
+    if not state.is_dir():
+        if args.apply:
+            raise BridgeError('Каталог состояния отсутствует; обслуживание не выполнено')
+        print(json.dumps({'applied': False, 'databases': {}, 'state': 'missing'}))
+        return 0
+    with ExitStack() as stack:
+        if args.apply:
+            stack.enter_context(process_lock(state))
+            stack.enter_context(process_lock(state, 'monitor.lock'))
+        # Check both databases before any mutation or VACUUM. Do not initialize, migrate or recover.
+        paths = {}
+        fd = storage.directory(state)
+        try:
+            for kind, name in (('bridge', 'bridge.sqlite3'), ('monitor', 'monitor.sqlite3')):
+                if storage.file_stat(fd, name) is None:
+                    continue
+                for suffix in ('-wal', '-shm'):
+                    storage.file_stat(fd, name + suffix)
+                path = state / name
+                with closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=0.1)) as db:
+                    version = db.execute('PRAGMA user_version').fetchone()[0]
+                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    needed = {'meta', 'jobs', 'inbox', 'audit', 'quarantine'} if kind == 'bridge' else {'monitor_state', 'alerts'}
+                    if version != (SCHEMA_VERSION if kind == 'bridge' else 0) or not needed <= tables:
+                        raise BridgeError('Схема базы не подходит для обслуживания; данные не изменены')
+                    if args.apply and db.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
+                        raise BridgeError('Для обслуживания требуется WAL; режим базы не изменён')
+                paths[kind] = path
+        finally:
+            os.close(fd)
+        if args.apply and not paths:
+            raise BridgeError('Базы для обслуживания отсутствуют; данные не изменены')
+        if args.compact:
+            required = 2 * sum(path.stat().st_size for path in paths.values()) + storage_settings().free_critical_bytes
+            disk = os.statvfs(state)
+            if disk.f_bavail * disk.f_frsize < required:
+                raise BridgeError('Недостаточно свободного места для уплотнения; данные не изменены')
+        stopping = False
+
+        def stop(_signum, _frame):
+            nonlocal stopping
+            stopping = True
+
+        previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+        output = {'applied': args.apply, 'databases': {}}
+        compact_deadline = time.monotonic() + 20
+        try:
+            for kind, path in paths.items():
+                if stopping:
+                    break
+                mode = 'rw' if args.apply else 'ro'
+                with closing(sqlite3.connect(path.absolute().as_uri() + '?mode=' + mode, uri=True, timeout=0.1)) as db:
+                    db.row_factory = sqlite3.Row
+                    if args.apply:
+                        if db.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
+                            raise BridgeError('Для обслуживания требуется WAL; режим базы не изменён')
+                        db.execute('PRAGMA synchronous=FULL')
+                    result = retention.Maintainer(db, kind, args.retention).run(apply=args.apply, stopping=lambda: stopping)
+                    if args.apply and not stopping and result['state'] == 'ok':
+                        result['checkpoint'] = retention.checkpoint(db)
+                    if args.compact and not stopping and result['state'] == 'ok':
+                        # Explicit offline work only, bounded separately from small runtime batches.
+                        remaining_ms = max(1, int((compact_deadline - time.monotonic()) * 1000))
+                        with retention.bounded(db, remaining_ms, lambda: stopping):
+                            db.execute('VACUUM')
+                        result['compacted'] = True
+                        result['space'] = retention.metrics(db)
+                    output['databases'][kind] = result
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        output['stopped'] = stopping
+        print(json.dumps(output, sort_keys=True))
+        return int(stopping or any(r['state'] != 'ok' or r.get('checkpoint', {}).get('state') == 'deferred'
+                                   for r in output['databases'].values()))
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status', 'queue', 'quarantine', 'health', 'monitor'])
+    parser.add_argument('command', choices=['doctor', 'discover', 'bind', 'run', 'status', 'queue', 'quarantine', 'health', 'monitor', 'maintenance'])
     parser.add_argument('action', nargs='?', choices=['list', 'show', 'retry', 'confirm', 'skip'])
     parser.add_argument('id', nargs='?', type=int)
     parser.add_argument('--seconds', type=int, default=90)
@@ -1540,13 +1680,19 @@ def main(argv=None):
     parser.add_argument('--interval', type=float, default=30)
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--alerts-file', type=Path)
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--compact', action='store_true')
     args = parser.parse_args(argv)
     if not all(math.isfinite(value) and value > 0 for value in (args.stale_after, args.queue_age, args.interval)):
         parser.error('Интервалы должны быть конечными положительными числами')
     if args.interval > 60:
         parser.error('--interval должен быть не более 60 секунд')
-    if args.json and args.command not in ('status', 'health'):
-        parser.error('--json разрешён только для status/health')
+    if args.json and args.command not in ('status', 'health', 'maintenance'):
+        parser.error('--json разрешён только для status/health/maintenance')
+    if (args.apply or args.compact) and args.command != 'maintenance':
+        parser.error('--apply/--compact разрешены только для maintenance')
+    if args.compact and not args.apply:
+        parser.error('--compact требует --apply')
     if (args.once or args.alerts_file is not None) and args.command != 'monitor':
         parser.error('--once/--alerts-file разрешены только для monitor')
     maintenance = args.command in ('queue', 'quarantine')
@@ -1574,11 +1720,14 @@ def main(argv=None):
         RUN['component'] = 'bridge' if args.command == 'run' else 'monitor'
         RUN['id'] = secrets.token_hex(8)
     args.storage = storage_settings() if args.command in ('run', 'monitor', 'status', 'health') else None
+    args.retention = retention_settings() if args.command in ('run', 'monitor', 'maintenance') else None
     state = args.state_dir
     if (args.alerts_file is not None and
             (args.alerts_file.name != 'alerts.jsonl' or args.alerts_file.parent.resolve() != state.resolve())):
         raise BridgeError('--alerts-file должен указывать на alerts.jsonl в выбранном --state-dir')
     db_path = state / 'bridge.sqlite3'
+    if args.command == 'maintenance':
+        return maintenance_command(state, args)
     if args.command == 'monitor':
         monitor(state, args)
         return
@@ -1647,6 +1796,7 @@ async def network_command(args, state, db_path):
             store.recover()
             bridge = Bridge(cfg, api, store, ids)
             bridge.storage_gate = storage.Gate(state, getattr(args, 'storage', None) or storage.Settings())
+            bridge.maintainer = retention.Maintainer(store.db, 'bridge', getattr(args, 'retention', None) or retention.Settings())
             await run_bridge(bridge)
             log('info', 'bridge_stopped', message='Остановлено. Очередь сохранена.')
 
