@@ -347,11 +347,11 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.store.set('last_poll_success_' + platform, now)
                 self.store.set('last_poll_error_' + platform, '')
 
-    def telemetry(self, workers, run_id='run-now', now=1000):
+    def telemetry(self, workers, run_id='run-now', now=1000, resumed=None):
         self.healthy_telemetry(now)
         with self.store.db:
             self.store.set('run_id', run_id)
-            self.store.set('workers', json.dumps({'run_id': run_id, 'workers': workers}))
+            self.store.set('workers', json.dumps({'run_id': run_id, 'workers': workers, 'resumed_at': resumed}))
 
     def codes(self, snapshot):
         return {(i['code'], i.get('worker') or i.get('platform')) for i in snapshot['issues']}
@@ -381,6 +381,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                              ['problem', 'recovery'])
         finally:
             monitor.db.close()
+
+    async def test_worker_deadlines_restart_when_the_heartbeat_resumes_after_a_frozen_loop(self):
+        overdue = {'phase': 'wait', 'since': 500, 'until': 600, 'reason': None}
+        for resumed, stalled in ((None, True), (995, False), ('bad', True), (700, True)):
+            self.telemetry({'poll:tg': overdue}, resumed=resumed)
+            codes = self.codes(b.health_snapshot(self.store, now=1000, running=True, stale_after=180))
+            self.assertEqual(('worker_stalled', 'poll:tg') in codes, stalled, resumed)
 
     async def test_worker_telemetry_reports_stall_and_pause_but_not_planned_waits(self):
         ok = {'phase': 'wait', 'since': 990, 'until': 1001, 'reason': None}

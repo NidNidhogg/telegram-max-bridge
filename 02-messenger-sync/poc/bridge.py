@@ -817,11 +817,12 @@ class Store:
             else:
                 self.set('run_stopped', now)
 
-    def heartbeat(self, workers=None):
+    def heartbeat(self, workers=None, resumed=None):
         with self.db:
             self.set('heartbeat', time.time())
             if workers is not None:
-                self.set('workers', json.dumps({'run_id': self.get('run_id'), 'workers': workers}))
+                self.set('workers', json.dumps({'run_id': self.get('run_id'), 'workers': workers,
+                                                'resumed_at': resumed}))
 
     def poll_failure(self, platform, error):
         with self.db:
@@ -859,6 +860,8 @@ class Bridge:
         self.send_intervals = {'tg': 3.2, 'max': 0.6} if send_intervals is None else send_intervals
         # In-memory progress of each poller/sender; the heartbeat persists it, it never advances it.
         self.workers = {}
+        # Last time the heartbeat found the event loop frozen (SIGSTOP, host suspend).
+        self.resumed = None
         total = getattr(getattr(api, 'timeout', None), 'total', None) or 25
         # Per HTTP request: an operation stays healthy while each of its requests starts in time.
         self.budgets = {'poll': total + 5, 'deliver': total + 5}
@@ -1036,8 +1039,14 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
             await wait(delivery_interval)
 
     async def heartbeat():
+        last = None
         while not stop.is_set():
-            bridge.store.heartbeat(bridge.workers)
+            now = time.time()
+            # After a frozen loop no worker has had a chance to run yet: their deadlines restart here.
+            if last is not None and now - last > 2 * heartbeat_interval + 1:
+                bridge.resumed = now
+            last = now
+            bridge.store.heartbeat(bridge.workers, bridge.resumed)
             await wait(heartbeat_interval)
 
     if install_signals:
@@ -1227,6 +1236,8 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
     fresh = heartbeat is not None and age(heartbeat) <= stale_after
     if (running and state == 'running' and fresh and isinstance(telemetry, dict)
             and telemetry.get('run_id') == result['runtime']['run_id'] and isinstance(telemetry.get('workers'), dict)):
+        resumed = telemetry.get('resumed_at')
+        resumed = resumed if isinstance(resumed, (int, float)) and math.isfinite(resumed) else None
         for name in WORKERS:
             entry = telemetry['workers'].get(name)
             if not isinstance(entry, dict):
@@ -1237,8 +1248,9 @@ def health_snapshot(store, now=None, running=False, stale_after=180, queue_age=3
                             for v in (entry.get('since'), entry.get('until')))
             platform = name.split(':')[1]
             # A phase is stalled only well after its own deadline (operation timeout or planned wake-up).
+            deadline = None if until is None else max(until, resumed or until)
             worker_state = ('paused' if phase == 'paused' else
-                            'stalled' if until is not None and now > until + stale_after else 'ok')
+                            'stalled' if deadline is not None and now > deadline + stale_after else 'ok')
             result['workers'][name] = {'phase': phase, 'state': worker_state, 'since': since, 'until': until,
                                        'reason': reason}
             if worker_state == 'stalled':

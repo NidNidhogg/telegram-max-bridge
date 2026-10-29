@@ -924,6 +924,33 @@ class RuntimeTests(HttpServer):
         await self.until(lambda: 'worker_stalled' not in {c for c, _ in found()[1]})
 
 
+    async def test_frozen_event_loop_is_not_reported_as_stalled_workers_after_resume(self):
+        # SIGSTOP/host suspend freezes every task; on resume the heartbeat may run before the workers.
+        seen, frozen = set(), {'count': 0}
+        real_heartbeat = self.store.heartbeat
+
+        def heartbeat(*args):
+            real_heartbeat(*args)
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.3)
+            seen.update(i.get('worker') for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+
+        async def freeze():
+            while frozen['count'] < 3:
+                await asyncio.sleep(0.2)
+                time.sleep(1.2)
+                frozen['count'] += 1
+
+        self.store.heartbeat = heartbeat
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: self.store.get('workers'))
+            await freeze()
+            beats = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != beats)
+        self.assertEqual(seen, set())
+        self.assertIsNotNone(json.loads(self.store.get('workers')).get('resumed_at'))
+
     async def test_untrusted_api_code_does_not_stop_the_bridge(self):
         def handle(request, body):
             if request.path == '/getUpdates':
