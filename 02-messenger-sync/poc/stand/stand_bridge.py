@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run the unmodified bridge CLI against the stand mock API (test stand only)."""
+import asyncio
 import json
 import os
 import signal
@@ -21,7 +22,24 @@ def stand_api(cfg):
 
 
 def stand_bridge(cfg, api, store, ids):
-    return RealBridge(cfg, api, store, ids, send_intervals={'tg': 0.2, 'max': 0.2})
+    bridge = RealBridge(cfg, api, store, ids, send_intervals={'tg': 0.2, 'max': 0.2})
+    # Shorter operation budgets than production, still above the 25 s request timeout.
+    bridge.budgets = {'poll': 30, 'deliver': 40}
+    if POINT == 'worker':
+        # D4: STAND_FREEZE=worker:<poll|send>:<platform> hangs exactly one worker forever; the other
+        # workers and the heartbeat keep running.
+        kind, _, platform = MARKER.partition(':')
+        name = 'poll' if kind == 'poll' else 'deliver'
+        original, hang = getattr(bridge, name), asyncio.Event()
+
+        async def frozen(target, *args):
+            if target == platform:
+                print(f'stand: worker {kind}:{platform} frozen', file=sys.stderr, flush=True)
+                await hang.wait()
+            return await original(target, *args)
+
+        setattr(bridge, name, frozen)
+    return bridge
 
 
 def stand_check(url):
@@ -67,12 +85,11 @@ class StandStore(RealStore):
             freeze()  # sent and remote ID committed
 
 
-if MARKER:
+if MARKER and POINT != 'worker':
     b.Store = StandStore
 
 if __name__ == '__main__':
     try:
         sys.exit(b.main() or 0)
-    except (b.BridgeError, FileNotFoundError) as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(b.report_failure(exc))

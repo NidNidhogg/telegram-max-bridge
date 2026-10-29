@@ -1,5 +1,6 @@
 """Async transport/runtime checks against a real local HTTP server; no live tokens."""
 import asyncio
+import os
 from contextlib import redirect_stdout
 import email.utils
 import io
@@ -833,6 +834,281 @@ class RuntimeTests(HttpServer):
         await self.until(lambda: self.posts('/getUpdates') >= 1 and self.posts('/updates') >= 5)
         self.assertFalse(task.done())
         self.assertNotIn('tg', self.bridge.paused)
+
+
+    def json_lines(self, text):
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+        for record in records:
+            self.assertTrue({'timestamp', 'level', 'component', 'event', 'run_id'} <= set(record), record)
+            self.assertTrue(record['timestamp'].endswith('Z') and isinstance(record['run_id'], str), record)
+        return records
+
+    async def test_run_logs_are_safe_json_lines_for_each_outcome(self):
+        events = [tg(1, 'PRIVATE_TEXT_1'), tg(2, 'PRIVATE_TEXT_2')]
+        for event in events:
+            event['message']['from']['first_name'] = 'PRIVATE_AUTHOR'
+        self.store.accept('tg', events, 3, '-100', '99')
+        event = mx('m1')
+        event['message']['body']['text'] = 'PRIVATE_TEXT_3'
+        event['message']['sender']['first_name'] = 'PRIVATE_AUTHOR'
+        self.store.accept('max', [event], 'k1', '-200', '88')
+        replies = iter([web.json_response({'code': '429', 'message': 'PRIVATE_BODY'}, status=429),
+                        None, web.json_response({'code': 'PRIVATE_CODE'}, status=400)])
+
+        def handle(request, body):
+            if request.path == '/messages':
+                return next(replies) or self.normal(request, body)
+            if request.path == '/sendMessage':
+                return web.json_response({'ok': False, 'description': 'PRIVATE_BODY'}, status=500)
+            return self.normal(request, body)
+
+        self.handler = handle
+        output = io.StringIO()
+        with patch.object(b, 'SEND_BACKOFF', (0.01, 0.02)), redirect_stdout(output):
+            stop, task = self.start()
+            await self.until(lambda: [self.state(i) for i in (1, 2, 3)] == ['sent', 'failed', 'uncertain'], 5)
+            stop.set()
+            await task
+        records = self.json_lines(output.getvalue())
+        events = [r['event'] for r in records]
+        for event in ('bridge_started', 'delivery_retry_scheduled', 'delivery_sent', 'delivery_failed',
+                      'delivery_uncertain'):
+            self.assertIn(event, events)
+        retry = next(r for r in records if r['event'] == 'delivery_retry_scheduled')
+        self.assertEqual((retry['error_code'], retry['http_status'], retry['direction'], retry['job_id'], retry['state']),
+                         ('rate_limited', 429, 'tg>max', 1, 'pending'))
+        self.assertTrue(retry['retry_at'] > 0 and retry['delay_seconds'] > 0)
+        uncertain = next(r for r in records if r['event'] == 'delivery_uncertain')
+        self.assertEqual((uncertain['error_code'], uncertain['phase'], uncertain['direction'], uncertain['job_id']),
+                         ('server_error', 'publish', 'max>tg', 3))
+        self.assertEqual(next(r for r in records if r['event'] == 'delivery_failed')['error_code'], 'api_rejected')
+        self.assertEqual(len({r['run_id'] for r in records}), 1)
+        self.assertFalse([e for e in events if e.startswith('poll') or 'heartbeat' in e])
+        for marker in ('PRIVATE', '127.0.0.1'):
+            self.assertNotIn(marker, output.getvalue())
+        error = self.store.db.execute('SELECT error FROM jobs WHERE id=2').fetchone()[0]
+        self.assertTrue(error.startswith('api_rejected http=400') and 'PRIVATE' not in error, error)
+
+    async def test_one_stalled_worker_is_reported_while_heartbeat_and_others_continue(self):
+        release = asyncio.Event()
+        real_poll, real_deliver = self.bridge.poll, self.bridge.deliver
+
+        async def poll(platform):
+            if platform == 'max':
+                await release.wait()
+            return await real_poll(platform)
+
+        async def deliver(destination, stop=None):
+            if destination == 'tg':
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        self.bridge.poll, self.bridge.deliver = poll, deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        self.start()
+
+        def found():
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.5)
+            return snapshot, {(i['code'], i.get('worker')) for i in snapshot['issues']}
+
+        await self.until(lambda: {('worker_stalled', 'poll:max'), ('worker_stalled', 'send:tg')} <= found()[1])
+        snapshot, codes = found()
+        self.assertEqual({w for c, w in codes if c == 'worker_stalled'}, {'poll:max', 'send:tg'})
+        self.assertNotIn('heartbeat_stale', {c for c, _ in codes})
+        stalled = next(i for i in snapshot['issues'] if i.get('worker') == 'poll:max')
+        self.assertEqual((stalled['platform'], stalled['phase']), ('max', 'poll'))
+        self.assertEqual(snapshot['workers']['send:max']['state'], 'ok')
+        polls = self.posts('/getUpdates')
+        await self.until(lambda: self.posts('/getUpdates') > polls + 3)
+        release.set()
+        await self.until(lambda: 'worker_stalled' not in {c for c, _ in found()[1]})
+
+
+    async def test_frozen_event_loop_is_not_reported_as_stalled_workers_after_resume(self):
+        # SIGSTOP/host suspend freezes every task; on resume the heartbeat may run before the workers.
+        seen, frozen = set(), {'count': 0}
+        real_heartbeat = self.store.heartbeat
+
+        def heartbeat(*args):
+            real_heartbeat(*args)
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.3)
+            seen.update(i.get('worker') for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+
+        async def freeze():
+            while frozen['count'] < 3:
+                await asyncio.sleep(0.2)
+                time.sleep(1.2)
+                frozen['count'] += 1
+
+        self.store.heartbeat = heartbeat
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: self.store.get('workers'))
+            await freeze()
+            beats = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != beats)
+        self.assertEqual(seen, set())
+
+    async def test_known_stall_is_not_recovered_by_resuming_a_frozen_loop(self):
+        # F2 x F7: SIGCONT of the whole process does not confirm progress of a worker that was already hung.
+        release = asyncio.Event()
+        real_deliver = self.bridge.deliver
+
+        async def deliver(destination, stop=None):
+            if destination == 'max':
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        self.bridge.deliver = deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        monitor = b.AlertMonitor(':memory:')
+        self.addCleanup(monitor.db.close)
+        emitted = []
+
+        def observe():
+            monitor.observe(b.health_snapshot(self.store, running=True, stale_after=0.3))
+            monitor.flush(emitted.append)
+            return [a['kind'] for a in emitted if a['issue'].get('worker') == 'send:max']
+
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: observe() == ['problem'])
+            time.sleep(1.2)
+            beats = self.store.get('heartbeat')
+            await self.until(lambda: self.store.get('heartbeat') != beats)
+            for _ in range(8):
+                observe()
+                await asyncio.sleep(0.1)
+            self.assertEqual(observe(), ['problem'])
+            release.set()
+            await self.until(lambda: observe() == ['problem', 'recovery'])
+            for _ in range(3):
+                observe()
+                await asyncio.sleep(0.05)
+        self.assertEqual(observe(), ['problem', 'recovery'])
+
+    async def test_phase_started_after_resume_keeps_its_own_budget(self):
+        # F9: a worker may run before the heartbeat after SIGCONT; its new deadline is not shifted by the freeze.
+        release, resumed = asyncio.Event(), {}
+        real_deliver = self.bridge.deliver
+
+        async def deliver(destination, stop=None):
+            if destination == 'max' and not resumed:
+                await asyncio.sleep(0.1)
+                time.sleep(1.2)
+                resumed['at'] = time.time()
+                # The next delivery phase starts in the same task, before the heartbeat can run.
+                self.bridge.phase('send:max', 'deliver', time.time() + self.bridge.budgets['deliver'])
+                await release.wait()
+            return await real_deliver(destination, stop)
+
+        def stalled():
+            snapshot = b.health_snapshot(self.store, running=True, stale_after=0.3)
+            return snapshot['runtime']['heartbeat_at'] > resumed['at'] and any(
+                i.get('worker') == 'send:max' for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+
+        self.bridge.deliver = deliver
+        self.bridge.budgets = {'poll': 0.05, 'deliver': 0.05}
+        asyncio.get_running_loop().slow_callback_duration = 5
+        with redirect_stdout(io.StringIO()):
+            self.start()
+            await self.until(lambda: resumed)
+            await self.until(stalled, 2)
+            detected = time.time() - resumed['at']
+            release.set()
+        self.assertLess(detected, 0.05 + 0.3 + 0.4)
+
+    async def test_resume_shifts_only_deadlines_that_lived_through_the_freeze(self):
+        self.bridge.workers = {
+            'send:max': {'phase': 'deliver', 'since': 100, 'until': 105, 'progress_at': 100, 'reason': None},
+            'send:tg': {'phase': 'deliver', 'since': 119, 'until': 125, 'progress_at': 119, 'reason': None},
+            'poll:tg': {'phase': 'poll', 'since': 100, 'until': 150, 'progress_at': 119.5, 'reason': None},
+            'poll:max': {'phase': 'paused', 'since': 100, 'until': None, 'progress_at': 100, 'reason': None}}
+        self.bridge.resumed(last=101, now=120, interval=2)
+        self.assertEqual({k: v['until'] for k, v in self.bridge.workers.items()},
+                         {'send:max': 122, 'send:tg': 125, 'poll:tg': 150, 'poll:max': None})
+        self.assertEqual(self.bridge.workers['send:max']['since'], 100)
+
+    async def test_untrusted_api_code_does_not_stop_the_bridge(self):
+        def handle(request, body):
+            if request.path == '/getUpdates':
+                return web.json_response({'ok': False, 'error_code': '\u00b2'}, status=429)
+            return self.normal(request, body)
+
+        self.handler = handle
+        with redirect_stdout(io.StringIO()):
+            _, task = self.start()
+            await self.until(lambda: self.store.get('last_poll_error_tg'))
+            polls = self.posts('/updates')
+            await self.until(lambda: self.posts('/updates') > polls + 3)
+        self.assertFalse(task.done())
+        self.assertEqual(self.store.get('runtime_state'), 'running')
+        self.assertTrue(self.store.get('last_poll_error_tg').startswith('rate_limited http=429'))
+
+    async def test_http_5xx_reason_wins_over_attachment_not_ready_body(self):
+        self.store.accept('tg', [tg(1)], 2, '-100', '99')
+        self.handler = lambda request, body: (web.json_response({'code': 'attachment.not.ready'}, status=503)
+                                              if request.path == '/messages' else self.normal(request, body))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            await self.bridge.deliver('max')
+        self.assertEqual((self.state(1), self.posts('/messages')), ('uncertain', 1))
+        record = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual((record['event'], record['error_code'], record['http_status']),
+                         ('delivery_uncertain', 'server_error', 503))
+        snapshot = b.health_snapshot(self.store, running=True)
+        self.assertEqual(snapshot['platforms']['max']['delivery']['head']['reason'], 'server_error')
+
+    async def test_slow_but_progressing_photo_delivery_is_not_a_stall(self):
+        event = tg(2)
+        event['message']['photo'] = [{'file_id': 'file'}]
+        self.store.accept('tg', [event], 3, '-100', '99')
+        self.client.tg_file_base = self.url + '/files'
+        self.original_media_check = b.check_media_url
+
+        async def handle(request, body):
+            if request.path in ('/getFile', '/files/image.jpg', '/uploads', '/upload', '/messages'):
+                await asyncio.sleep(0.2)
+            if request.path == '/getFile':
+                return web.json_response({'ok': True, 'result': {'file_path': 'image.jpg'}})
+            if request.path == '/files/image.jpg':
+                return web.Response(body=b'\xff\xd8\xffphoto')
+            if request.path == '/uploads':
+                return web.json_response({'url': self.url + '/upload'})
+            if request.path == '/upload':
+                return web.json_response({'token': 'photo-token'})
+            return self.normal(request, body)
+
+        self.handler = handle
+        self.bridge.budgets = {'poll': 0.3, 'deliver': 0.3}
+        seen = set()
+        with patch.object(b, 'check_media_url', side_effect=self.allow_local_media), redirect_stdout(io.StringIO()):
+            self.start()
+
+            def sample():
+                snapshot = b.health_snapshot(self.store, running=True, stale_after=0.2)
+                seen.update(i.get('worker') for i in snapshot['issues'] if i['code'] == 'worker_stalled')
+                return self.state(1) == 'sent'
+
+            await self.until(sample, 10)
+        self.assertNotIn('send:max', seen)
+
+    async def test_cli_run_failure_has_run_id_in_json(self):
+        import sys
+        with tempfile.TemporaryDirectory() as state:
+            env = {'PATH': os.environ.get('PATH', ''), 'HOME': state, 'TG_BOT_TOKEN': '', 'MAX_BOT_TOKEN': ''}
+            runs = [subprocess.run([sys.executable, b.__file__, 'run', '--state-dir', state], env=env,
+                                   capture_output=True, text=True, timeout=60) for _ in range(2)]
+        ids = []
+        for run in runs:
+            self.assertEqual(run.returncode, 1, run.stderr)
+            records = [json.loads(line) for line in (run.stdout + run.stderr).splitlines() if line.strip()]
+            failure = next(r for r in records if r['event'] == 'stopped_with_error')
+            self.assertTrue(isinstance(failure['run_id'], str) and failure['run_id'])
+            ids.append(failure['run_id'])
+        self.assertNotEqual(ids[0], ids[1])
 
 
 if __name__ == '__main__':

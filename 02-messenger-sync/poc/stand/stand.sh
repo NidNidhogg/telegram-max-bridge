@@ -1,6 +1,6 @@
 #!/bin/sh
 # shellcheck disable=SC2086,SC2016,SC2046  # $C is intentionally word-split; quoted scripts run in the container
-# Isolated container stand for D1–D3: synthetic tokens, mock Telegram/MAX API on an internal
+# Isolated container stand for D1–D4: synthetic tokens, mock Telegram/MAX API on an internal
 # network, its own Compose project, image tag and volumes. Never touches the working project.
 set -eu
 cd "$(dirname "$0")/../../.."
@@ -23,12 +23,15 @@ export HEALTH_STALE_AFTER=6 HEALTH_QUEUE_AGE=8 HEALTH_INTERVAL=1s HEALTH_START_P
 C="docker compose -p $PROJECT -f compose.yaml -f 02-messenger-sync/poc/stand/compose.stand.yaml"
 M="make --no-print-directory PROJECT=$PROJECT"
 BROKEN=$(mktemp)
+LOGS=$(mktemp)
 
 step() { echo; echo "== $*"; }
+# Logs of a container are lost when it is recreated: keep them for the final contract check.
+keep_logs() { $C logs --no-log-prefix bridge monitor >>"$LOGS" 2>&1 || true; }
 ctl() { $C run --rm --no-deps -T ctl "$@"; }
 cid() { $C ps -aq bridge; }
 cleanup() {
-    rm -f "$BROKEN"
+    rm -f "$BROKEN" "$LOGS"
     [ "${KEEP_STAND:-0}" = 1 ] || $C --profile stand down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -80,7 +83,7 @@ ctl pending-start
 health_is unhealthy
 ctl health queue_too_old
 old=$(cid)
-$C up -d --force-recreate --no-deps bridge
+keep_logs; $C up -d --force-recreate --no-deps bridge
 [ "$old" != "$(cid)" ] || { echo 'bridge container was not recreated' >&2; exit 1; }
 ctl pending-check
 ctl pending-release
@@ -127,6 +130,7 @@ health_is healthy
 
 step 'state volume survives make down / make up'
 before=$(ctl snapshot)
+keep_logs
 $M COMPOSE="$C" down
 docker volume inspect "${PROJECT}_state" >/dev/null
 $M COMPOSE="$C" up
@@ -137,6 +141,7 @@ ctl reply-after-restart
 
 step 'make update keeps state; failed build does not stop the working version'
 before=$(ctl snapshot)
+keep_logs
 $M COMPOSE="$C" update
 [ "$before" = "$(ctl snapshot)" ]
 old=$(cid)
@@ -168,7 +173,7 @@ for scenario in 'error_after d2-5xx 641' 'drop_after d2-drop 642'; do
     set -- $scenario
     step "D2: $1 after a possible publication stays uncertain across recreation"
     set -- $(ctl d2-uncertain "$@") "$2" "$3"
-    $C up -d --force-recreate --no-deps bridge
+    keep_logs; $C up -d --force-recreate --no-deps bridge
     ctl d2-uncertain-stays "$3" "$4"
     ctl health delivery_blocked
     $M COMPOSE="$C" stop-bridge
@@ -179,14 +184,14 @@ health_is healthy
 
 step 'D2: recreation while a retry is scheduled keeps the job, reply link and retry time'
 ready=$(ctl d2-wait-start)
-$C up -d --force-recreate --no-deps bridge
+keep_logs; $C up -d --force-recreate --no-deps bridge
 ctl d2-wait-check "$ready"
 health_is healthy
 
 # D3 crash points: stand_bridge.py stops itself (SIGSTOP) at the armed point, the script checks
 # SQLite and the mock, then SIGKILLs the container and starts a new, unarmed one.
-arm() { STAND_FREEZE=$1 $C up -d --force-recreate --no-deps bridge; }
-fresh() { $C up -d --force-recreate --no-deps bridge; }
+arm() { keep_logs; STAND_FREEZE=$1 $C up -d --force-recreate --no-deps bridge; }
+fresh() { keep_logs; $C up -d --force-recreate --no-deps bridge; }
 # The restart policy is switched off first: an automatic restart must not race with the checks.
 crash() {
     docker update --restart=no "$(cid)" >/dev/null
@@ -298,6 +303,20 @@ echo "$out" | grep -q 'Другой процесс использует прот
 [ "$hits" = "$(ctl d3-hits tg:getMe)" ] || { echo 'second bridge contacted the API' >&2; exit 1; }
 echo 'owner lock OK: second instance refused before any API call; lock file was never removed'
 ctl d3-health-only input_quarantine
+
+seq=0
+for worker in poll:tg send:max poll:max send:tg; do
+    step "D4: stalled $worker is detected while the heartbeat and the other workers run"
+    seq=$((seq + 1))
+    arm "worker:$worker"
+    ctl d4-stalled "$worker" "$seq"
+    fresh
+    ctl d4-recovered "$worker"
+done
+
+step 'D4: bridge and monitor logs are JSON Lines without tokens, texts or author names'
+keep_logs
+ctl d4-logs <"$LOGS"
 
 echo
 echo 'Container stand passed: synthetic data only, no real API calls'

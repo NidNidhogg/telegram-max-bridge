@@ -3,6 +3,7 @@
 import email.utils
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -564,6 +565,92 @@ def step_d3_health_only(code):
 
 def step_d3_hits(route):
     print(mock_state()['hits'].get(route, 0))
+
+
+# --- D4: one stalled worker while the heartbeat and the other workers continue -------------
+
+def health_issues():
+    snap = b.read_health(STATE, float(os.environ['HEALTH_STALE_AFTER']), float(os.environ['HEALTH_QUEUE_AGE']))
+    return snap, snap['issues']
+
+
+def alerts(kind, worker):
+    path = STATE / 'alerts.jsonl'
+    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [e for e in events if e['kind'] == kind and e['issue'].get('code') == 'worker_stalled'
+            and e['issue'].get('worker') == worker]
+
+
+D4_SEQ = {'n': 0}
+
+
+def step_d4_stalled(worker, seq):
+    started = time.monotonic()
+    until(lambda: any(i['code'] == 'worker_stalled' and i.get('worker') == worker for i in health_issues()[1]),
+          f'worker_stalled {worker}', 120)
+    took = time.monotonic() - started
+    snap, issues = health_issues()
+    issue = next(i for i in issues if i['code'] == 'worker_stalled')
+    kind, platform = worker.split(':')
+    assert issue['platform'] == platform and issue['phase'] == ('poll' if kind == 'poll' else 'deliver'), issue
+    assert [i for i in issues if i['code'] == 'worker_stalled'] == [issue], issues
+    assert 'heartbeat_stale' not in {i['code'] for i in issues}, issues
+    assert all(w['state'] == 'ok' for n, w in snap['workers'].items() if n != worker), snap['workers']
+    # An independent direction keeps delivering: it needs neither the frozen poller nor sender.
+    source = 'max' if worker in ('poll:tg', 'send:max') else 'tg'
+    marker = f'd4-{worker.replace(":", "-")}'
+    inject(source, tg_event(800 + int(seq), marker) if source == 'tg' else max_event('d4' + seq, marker))
+    until(lambda: pubs(marker), f'{source} delivery while {worker} is stalled')
+    until(lambda: alerts('problem', worker), f'monitor problem for {worker}')
+    print(f'D4 stalled OK: {worker} reported (platform {platform}, phase {issue["phase"]}) after {took:.0f}s '
+          f'with a fresh heartbeat; {source} direction delivered; monitor problem event written')
+
+
+def step_d4_recovered(worker):
+    until(lambda: not any(i['code'] == 'worker_stalled' for i in health_issues()[1]), f'{worker} recovered', 60)
+    until(lambda: alerts('recovery', worker), f'monitor recovery for {worker}', 60)
+    assert len(alerts('problem', worker)) == 1 and len(alerts('recovery', worker)) == 1, worker
+    print(f'D4 recovered OK: {worker} healthy in the new container; exactly one problem and one recovery event')
+
+LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia')
+# Events the stand scenarios produce; delivery_failed (TLS, 4xx) is covered by test_async only.
+LOG_EVENTS = ('preflight_ok', 'bridge_started', 'bridge_stopped', 'delivery_sent', 'delivery_retry_scheduled',
+              'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
+
+
+def check_logs(lines, required=()):
+    """Every application line is a JSON object with the D4 fields; only stand wrapper lines are text."""
+    records = []
+    for number, line in enumerate(lines, 1):
+        line = line.rstrip('\n')
+        if LOG_MARKERS.search(line):
+            raise AssertionError(f'log line {number}: private marker')
+        if line.startswith('stand: '):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            raise AssertionError(f'log line {number}: not JSON') from None
+        if not isinstance(record, dict):
+            raise AssertionError(f'log line {number}: not a JSON object')
+        for key in ('timestamp', 'component', 'event', 'run_id'):
+            if not isinstance(record.get(key), str) or not record[key]:
+                raise AssertionError(f'log line {number}: {key} missing or empty')
+        if record.get('level') not in ('debug', 'info', 'warning', 'error') or \
+                record['component'] not in ('bridge', 'monitor'):
+            raise AssertionError(f'log line {number}: bad level or component')
+        records.append(record)
+    missing = sorted(set(required) - {r['event'] for r in records})
+    if missing:
+        raise AssertionError(f'log events missing: {missing}')
+    return records
+
+
+def step_d4_logs():
+    records = check_logs(sys.stdin.readlines(), LOG_EVENTS)
+    runs = {r['run_id'] for r in records}
+    print(f'logs OK: {len(records)} JSON records from {len(runs)} runs, no synthetic tokens, texts, names or URLs')
+
 
 if __name__ == '__main__':
     globals()['step_' + sys.argv[1].replace('-', '_')](*sys.argv[2:])
