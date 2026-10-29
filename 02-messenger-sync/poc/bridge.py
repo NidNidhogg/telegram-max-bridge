@@ -635,6 +635,7 @@ class Store:
                 reason TEXT NOT NULL, created REAL NOT NULL);
         ''')
         try:
+            retention.prepare(self.db, 'bridge')
             columns = {row['name'] for row in self.db.execute('PRAGMA table_info(jobs)')}
             for name in ('created', 'updated'):
                 if name not in columns:
@@ -1641,6 +1642,8 @@ def maintenance_command(state, args):
                         if db.execute('PRAGMA journal_mode').fetchone()[0] != 'wal':
                             raise BridgeError('Для обслуживания требуется WAL; режим базы не изменён')
                         db.execute('PRAGMA synchronous=FULL')
+                        with db:
+                            retention.prepare(db, kind)
                     result = retention.Maintainer(db, kind, args.retention).run(apply=args.apply, stopping=lambda: stopping)
                     if args.apply and not stopping and result['state'] == 'ok':
                         result['checkpoint'] = retention.checkpoint(db)

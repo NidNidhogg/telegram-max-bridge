@@ -75,6 +75,13 @@ def metrics(db):
             'reusable_pages': db.execute('PRAGMA freelist_count').fetchone()[0]}
 
 
+def prepare(db, kind):
+    if kind == 'bridge':
+        # Only unresolved jobs occupy this index; preserved completed IDs cannot make a
+        # quarantine dependency lookup scan the entire historical source chat each time.
+        db.execute("CREATE INDEX IF NOT EXISTS jobs_unresolved_retention ON jobs(source,chat) WHERE state NOT IN ('sent','skipped')")
+
+
 @contextmanager
 def bounded(db, budget_ms, stopping):
     deadline = time.monotonic() + budget_ms / 1000
@@ -105,6 +112,14 @@ class Maintainer:
         db, policy = self.db, self.policy
         content_cutoff, history_cutoff = now - policy.content_days * 86400, now - policy.history_days * 86400
         actions = {'jobs': [], 'quarantine': [], 'audit': []}
+        groups = {}
+
+        def closed(job, cutoff):
+            key = (job['source'], job['chat'], job['mid'], cutoff)
+            if key not in groups:
+                groups[key] = group_closed(db, job, cutoff, now)
+            return groups[key]
+
         cursors = report.get('cursors', {})
         next_cursors, scanned = {}, 0
         for table in actions:
@@ -113,7 +128,7 @@ class Maintainer:
             for row in rows:
                 if table == 'jobs':
                     if (policy.content_enabled and row['payload'] != CLEARED and row['state'] in CLOSED
-                            and group_closed(db, row, content_cutoff, now)):
+                            and closed(row, content_cutoff)):
                         actions[table].append(row['id'])
                 elif table == 'quarantine':
                     if (policy.content_enabled and row['state'] == 'resolved' and row['payload'] != CLEARED
@@ -127,7 +142,7 @@ class Maintainer:
                 elif stamp(row['created'], now) and row['created'] <= history_cutoff:
                     if row['scope'] == 'job':
                         job = db.execute('SELECT * FROM jobs WHERE id=?', (row['target_id'],)).fetchone()
-                        eligible = job is not None and group_closed(db, job, history_cutoff, now)
+                        eligible = job is not None and closed(job, history_cutoff)
                     elif row['scope'] == 'quarantine':
                         item = db.execute('SELECT * FROM quarantine WHERE id=?', (row['target_id'],)).fetchone()
                         eligible = item is not None and item['state'] == 'resolved' and expired(item, history_cutoff, now)

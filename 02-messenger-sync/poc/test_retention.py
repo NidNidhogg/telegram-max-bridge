@@ -132,6 +132,20 @@ class RetentionTests(unittest.TestCase):
             self.assertLessEqual(result['scanned'], 6)
         self.assertEqual(self.db.execute('SELECT count(*) FROM jobs WHERE payload=?', (r.CLEARED,)).fetchone()[0], 7)
 
+    def test_quarantine_cleanup_fits_default_budget_with_100000_preserved_ids(self):
+        old = self.now - 100 * DAY
+        with self.db:
+            self.db.execute("""WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+                INSERT INTO jobs(source,chat,mid,destination,part,payload,state,created,updated)
+                SELECT 'tg','-100',i,'max',0,?,'sent',?,? FROM n""", (r.CLEARED, old - 1, old))
+            self.db.executemany("""INSERT INTO quarantine(platform,chat,event_key,payload,error,state,created,updated)
+                VALUES('tg','-100',?,'{}','fixed','resolved',?,?)""", [(str(i), old - 1, old) for i in range(30)])
+        owner = r.Maintainer(self.db, 'bridge', r.Settings())
+        result = owner.run(now=self.now)
+        self.assertEqual(result['state'], 'ok')
+        self.assertEqual(result['counts']['quarantine'], 30)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 100000)
+
     def test_dry_run_and_health_keep_logical_snapshots_and_hide_contents(self):
         self.seed()
         alerts = b.AlertMonitor(self.state / 'monitor.sqlite3')
