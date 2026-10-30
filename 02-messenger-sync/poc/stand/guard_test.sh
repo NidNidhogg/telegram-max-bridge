@@ -50,6 +50,18 @@ if fake_make cli PROJECT=work ARGS=; then fail 'make cli without ARGS succeeded'
 [ ! -s "$tmp/log" ] || fail 'make cli without ARGS called docker'
 echo 'make cli OK: quoted arguments passed intact, empty ARGS refused without docker'
 
+fake_make maintenance PROJECT=work || fail 'maintenance dry-run failed'
+grep -q '\[maintenance\]$' "$tmp/log" || fail 'maintenance dry-run unexpectedly applied changes'
+fake_make maintenance PROJECT=work APPLY=1 || fail 'maintenance apply failed'
+grep -q '\[maintenance\]\[--apply\]$' "$tmp/log" || fail 'maintenance apply flag missing'
+fake_make compact PROJECT=work || fail 'compact failed'
+grep -q '\[maintenance\]\[--apply\]\[--compact\]$' "$tmp/log" || fail 'compact flags missing'
+for apply in '' invalid '0 1'; do
+    if fake_make maintenance PROJECT=work APPLY="$apply"; then fail 'invalid APPLY succeeded'; fi
+    [ ! -s "$tmp/log" ] || fail 'invalid APPLY called docker'
+done
+echo 'maintenance make OK: default dry-run, explicit apply/compact, invalid APPLY refused'
+
 # Compose resolves env_file differently inside YAML anchors and file overrides. Exercise the
 # actual parser with synthetic values; config does not start containers or contact the daemon.
 if command -v docker >/dev/null 2>&1; then

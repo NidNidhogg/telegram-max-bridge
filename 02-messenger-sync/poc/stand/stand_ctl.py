@@ -612,7 +612,7 @@ def step_d4_recovered(worker):
     assert len(alerts('problem', worker)) == 1 and len(alerts('recovery', worker)) == 1, worker
     print(f'D4 recovered OK: {worker} healthy in the new container; exactly one problem and one recovery event')
 
-LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[234]-|mockapi|tgfile|maxmedia')
+LOG_MARKERS = re.compile(r'synthetic-(tg|max)-token|Authorization|Tester|stand-[tm][0-9]|d[2345]-|d52-|mockapi|tgfile|maxmedia')
 # Events the stand scenarios produce; delivery_failed (TLS, 4xx) is covered by test_async only.
 LOG_EVENTS = ('preflight_ok', 'bridge_started', 'bridge_stopped', 'delivery_sent', 'delivery_retry_scheduled',
               'delivery_uncertain', 'poll_failed', 'poll_recovered', 'monitor_started')
@@ -717,6 +717,256 @@ def step_d5_rotation():
     result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(RotationTests))
     assert result.wasSuccessful(), 'D5 rotation regression failed'
     print('D5 rotation OK: bounded JSON files, expiration, safe paths, partial-line repair, durable outbox and real SIGKILL')
+
+
+def step_d52_cycles():
+    # Same real-SQLite cycle scenario as make test, repeated by the isolated Docker smoke.
+    import unittest
+
+    from test_retention import RetentionCycleTests
+
+    class VolumeCycleTests(RetentionCycleTests):
+        STATE_ROOT = STATE
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(VolumeCycleTests))
+    assert result.wasSuccessful(), 'D5 cycle regression failed'
+    print('D5 cycles OK: 60 paired cycles, real SQLite/WAL, retained IDs/replies, protected queue and outbox')
+
+
+def step_d52_compatibility():
+    import unittest
+
+    from test_retention import RetentionCompatibilityTests
+
+    class VolumeCompatibilityTests(RetentionCompatibilityTests):
+        STATE_ROOT = STATE
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(VolumeCompatibilityTests))
+    assert result.wasSuccessful(), 'D5 compatibility regression failed'
+    print('D5 compatibility OK: physical legacy v3 adoption, retained IDs/replies, recovery confirmation and durable alert ACK')
+
+
+def step_d52_seed():
+    assert not b.bridge_running(STATE), 'stop the bridge before preparing retention fixtures'
+    path = STATE / 'stand-d52-fixture.json'
+    with b.process_lock(STATE), b.Store(STATE / 'bridge.sqlite3') as store:
+        rows = [dict(row) for row in store.db.execute("SELECT * FROM jobs WHERE (source='tg' AND mid IN ('1','2','3')) OR (source='max' AND mid IN ('m1','m2','m3')) ORDER BY id")]
+        assert len(rows) == 6 and all(row['state'] == 'sent' for row in rows)
+        originals = json.loads(path.read_text())['rows'] if path.exists() else rows
+        now = time.time()
+        with store.db:
+            for row in originals:
+                store.db.execute('UPDATE jobs SET payload=?,created=?,updated=? WHERE id=?',
+                                 (row['payload'], now - 32 * 86400, now - 31 * 86400, row['id']))
+        ids = [row['id'] for row in rows]
+        fixture = {'rows': [dict(row) for row in store.db.execute('SELECT * FROM jobs ORDER BY id') if row['id'] in ids],
+                   'publications': len(call('state')['publications'])}
+        path.write_text(json.dumps(fixture))
+    print('D5.2 fixture: six completed old text/photo/reply jobs; IDs and mappings preserved')
+
+
+def d52_check_content(expected):
+    fixture = json.loads((STATE / 'stand-d52-fixture.json').read_text())
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        count = 0
+        for original in fixture['rows']:
+            row = dict(conn.execute('SELECT * FROM jobs WHERE id=?', (original['id'],)).fetchone())
+            count += row['payload'] == b.retention.CLEARED
+            assert {k: v for k, v in row.items() if k != 'payload'} == {k: v for k, v in original.items() if k != 'payload'}
+        if expected == 'atomic':
+            assert count in (0, 6), 'partial maintenance transaction'
+        else:
+            assert count == expected, (count, expected)
+    assert len(call('state')['publications']) == fixture['publications'], 'maintenance published a duplicate'
+    return count
+
+
+def step_d52_unchanged():
+    d52_check_content(0)
+    print('D5.2 rollback OK: unfinished transaction did not clear content or change deliveries')
+
+
+def step_d52_atomic():
+    d52_check_content('atomic')
+    print('D5.2 SIGTERM OK: complete or rolled-back batch; no partial changes or publication')
+
+
+def d52_count():
+    fixture = json.loads((STATE / 'stand-d52-fixture.json').read_text())
+    with db() as conn:
+        return sum(conn.execute('SELECT payload FROM jobs WHERE id=?', (row['id'],)).fetchone()[0] == b.retention.CLEARED
+                   for row in fixture['rows'])
+
+
+def step_d52_cleaned():
+    until(lambda: d52_count() == 6, 'automatic content cleanup after restart', 30)
+    d52_check_content(6)
+    before = call('state')
+    call('replay', platform='tg')
+    call('replay', platform='max')
+    until(lambda: all(call('state')['polls'][p] >= before['polls'][p] + 3 for p in ('tg', 'max')), 'replay after retention')
+    d52_check_content(6)
+    print('D5.2 recovery OK: cleared six payloads; old IDs/reply mappings and dedup survive replay')
+
+
+def step_d52_replies():
+    inject('tg', tg_event(4001, 'd52-reply-tg', reply_to=pub('stand-m1')['remote_id']))
+    inject('max', max_event('d52reply', 'd52-reply-max', reply_to=pub('stand-t1')['remote_id']))
+    inject('tg', tg_event(4002, 'd52-identical'))
+    inject('tg', tg_event(4003, 'd52-identical'))
+    until(lambda: pubs('d52-reply-tg') and pubs('d52-reply-max') and len(pubs('d52-identical')) == 2,
+          'replies and independent identical texts after cleanup')
+    assert pub('d52-reply-tg')['reply'] == 'm1'
+    assert pub('d52-reply-max')['reply'] == 1
+    print('D5.2 replies OK: old mirrored messages map both ways; identical texts stay separate')
+
+
+def stop_batch(platform):
+    mids = list(range(5001, 5005)) if platform == 'tg' else ['stop-m1', 'stop-m2', 'stop-m3', 'stop-m4']
+    event = tg_event if platform == 'tg' else max_event
+    events = [event(mid, f'd52-term-{platform}-{i}') for i, mid in enumerate(mids)]
+    events[1] = event(mids[1], long_text(f'd52-term-{platform}-long'))
+    if platform == 'tg':
+        events[2]['message'].pop('text')
+        events[2]['message']['photo'] = [{'file_size': 1}]
+    else:
+        events[2]['message']['body']['attachments'] = [{'type': 'image', 'payload': {}}]
+    return mids, events
+
+
+def stop_batch_state(platform):
+    with db() as conn:
+        return {'cursor': meta('cursor_' + platform),
+                'jobs': conn.execute('SELECT count(*) FROM jobs').fetchone()[0],
+                'inbox': conn.execute('SELECT count(*) FROM inbox').fetchone()[0],
+                'quarantine': quarantined(), 'publications': total_pubs()}
+
+
+def step_d52_term_start(platform):
+    mids, events = stop_batch(platform)
+    path = STATE / f'stand-stop-{platform}.json'
+    with path.open('x') as stream:
+        json.dump(stop_batch_state(platform), stream)
+    call('inject_many', platform=platform, events=events)
+
+
+def step_d52_term_check(platform, stage):
+    before = json.loads((STATE / f'stand-stop-{platform}.json').read_text())
+    mids, _ = stop_batch(platform)
+    rows = [parts(platform, m) for m in mids]
+    if stage == 'frozen':
+        assert stop_batch_state(platform) == before
+        assert not any(rows)
+    elif stage == 'stopped':
+        after = stop_batch_state(platform)
+        committed = bool(rows[0])
+        delta = 1 if committed else 0
+        assert [len(r) for r in rows] == ([1, 2, 0, 1] if committed else [0] * 4)
+        assert all(r['state'] == 'pending' for group in rows for r in group)
+        assert after['jobs'] == before['jobs'] + 4 * delta
+        assert after['inbox'] == before['inbox'] + 3 * delta
+        assert after['quarantine'] == before['quarantine'] + delta
+        expected_cursor = '5005' if platform == 'tg' else str(int(before['cursor']) + 4)
+        assert after['cursor'] == (expected_cursor if committed else before['cursor'])
+        assert after['publications'] == before['publications']
+        assert meta('runtime_state') == 'stopped'
+    else:
+        call('replay', platform=platform)
+        until(lambda: all(parts(platform, m) and all(r['state'] == 'sent' for r in parts(platform, m))
+                          for m in (mids[0], mids[1], mids[3])), 'TERM batch recovery')
+        polls = call('state')['polls'][platform]
+        call('replay', platform=platform)
+        until(lambda: call('state')['polls'][platform] >= polls + 3, 'second TERM replay')
+        after = stop_batch_state(platform)
+        assert [len(parts(platform, m)) for m in mids] == [1, 2, 0, 1]
+        assert after['jobs'] == before['jobs'] + 4 and after['inbox'] == before['inbox'] + 3
+        assert after['quarantine'] == before['quarantine'] + 1
+        assert after['publications'] == before['publications'] + 4
+        order(f'd52-term-{platform}-0', f'd52-term-{platform}-long', f'd52-term-{platform}-3')
+    print(f'D5 SIGTERM intake {platform} {stage} OK')
+
+
+def step_d52_full_seed():
+    call('max_publish', mode='error_after')
+    inject('tg', tg_event(9301, 'd52-full-uncertain'))
+    until(lambda: parts('tg', 9301) and job('tg', 9301)['state'] == 'uncertain', 'uncertain before full stop')
+    call('max_publish', mode='ok')
+    inject('tg', tg_event(9302, 'd52-full-pending', reply_to=9301))
+    until(lambda: parts('tg', 9302), 'pending before full stop')
+    assert job('tg', 9302)['state'] == 'pending'
+    assert len(pubs('d52-full-uncertain')) == 1 and not pubs('d52-full-pending')
+    print('D5 full stop seeded: unresolved publication and dependent pending reply')
+
+
+def step_d52_full_fill():
+    import errno
+    disk = os.statvfs(STATE)
+    assert disk.f_blocks * disk.f_frsize == 128 * 1024**2, 'refuse to fill an unbounded state volume'
+    path = STATE / 'd52-stop-owned-pressure.bin'
+    expected = STATE / 'stand-stop-full-expected.json'
+    data = json.loads(expected.read_text())
+    with path.open('xb', buffering=0) as stream:
+        info = os.fstat(stream.fileno())
+        data.update(device=info.st_dev, inode=info.st_ino)
+        with expected.open('w') as output:
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            while True:
+                stream.write(b'x' * 1024**2)
+        except OSError as exc:
+            assert exc.errno == errno.ENOSPC, exc
+        os.fsync(stream.fileno())
+    assert os.statvfs(STATE).f_bavail * disk.f_frsize < 4096
+    print('D5 full stop: bounded state volume really exhausted; only stand-owned file allocated')
+
+
+def step_d52_full_release():
+    import stat
+    expected = json.loads((STATE / 'stand-stop-full-expected.json').read_text())
+    path = STATE / 'd52-stop-owned-pressure.bin'
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    assert (info.st_dev, info.st_ino) == (expected['device'], expected['inode'])
+    with b.process_lock(STATE):
+        path.unlink()
+        assert logical_snapshot(STATE / 'bridge.sqlite3') == expected['snapshot'], 'failed final transaction changed data'
+        with db() as conn:
+            assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+    assert meta('runtime_state') == 'running', 'failed final write must not persist stopped'
+    view, issues = health_issues()
+    assert any(i['code'] == 'process_stopped' for i in issues), view
+    assert not any(i['code'] == 'state_unavailable' for i in issues), view
+    assert job('tg', 9301)['state'] == 'uncertain' and job('tg', 9302)['state'] == 'pending'
+    print('D5 full stop: lock released, transaction rolled back, integrity/queue/cursor preserved, health sees stopped process')
+
+
+def step_d52_full_logs():
+    lines = sys.stdin.read().splitlines()
+    assert 'stand: final runtime write raised SQLITE_FULL' in lines
+    records = [json.loads(line) for line in lines if line.startswith('{')]
+    assert any(r['event'] == 'stopped_with_error' and r.get('error_code') == 'storage_error' for r in records)
+    assert not any(r['event'] == 'bridge_stopped' for r in records), 'false successful shutdown'
+    print('D5 full stop logs OK: real SQLITE_FULL, sanitized storage_error, no successful shutdown')
+
+
+def step_d52_full_restarted():
+    polls = call('state')['polls']['tg']
+    call('replay', platform='tg')
+    until(lambda: call('state')['polls']['tg'] >= polls + 3, 'polling after free space and restart')
+    assert job('tg', 9301)['state'] == 'uncertain' and job('tg', 9302)['state'] == 'pending'
+    assert len(pubs('d52-full-uncertain')) == 1 and not pubs('d52-full-pending')
+    print(job('tg', 9301)['id'], pub('d52-full-uncertain')['remote_id'])
+
+
+def step_d52_full_done():
+    until(lambda: pubs('d52-full-pending'), 'pending reply after explicit confirmation')
+    assert job('tg', 9301)['state'] == job('tg', 9302)['state'] == 'sent'
+    assert len(pubs('d52-full-uncertain')) == 1
+    assert pub('d52-full-pending')['reply'] == pub('d52-full-uncertain')['remote_id']
+    print('D5 full stop recovery OK: no uncertain retry; confirmed copy restores dependent reply exactly once')
 
 
 if __name__ == '__main__':

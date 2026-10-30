@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import sqlite3
 import sys
 import urllib.parse
 from pathlib import Path
@@ -66,6 +67,25 @@ def marked(store, jid):
 
 
 class StandStore(RealStore):
+    def runtime(self, state, run_id=None):
+        if POINT == 'stop-full' and state == 'running':
+            # Ensure final COMMIT needs real free space, rather than recycling a checkpointed WAL.
+            self.db.execute('PRAGMA wal_autocheckpoint=0')
+        if POINT == 'stop-full' and state == 'stopped':
+            from stand_ctl import STATE, logical_snapshot
+            expected = STATE / 'stand-stop-full-expected.json'
+            with expected.open('x') as stream:
+                json.dump({'snapshot': logical_snapshot(STATE / 'bridge.sqlite3')}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            freeze()  # workers drained; before the real final transaction
+        try:
+            return super().runtime(state, run_id)
+        except sqlite3.Error as exc:
+            if POINT == 'stop-full' and state == 'stopped' and exc.sqlite_errorcode == sqlite3.SQLITE_FULL:
+                print('stand: final runtime write raised SQLITE_FULL', file=sys.stderr, flush=True)
+            raise
+
     def accept_one(self, platform, event, chat_id, own_id):
         super().accept_one(platform, event, chat_id, own_id)
         if POINT == 'accept' and MARKER in json.dumps(event, ensure_ascii=False):
@@ -87,6 +107,16 @@ class StandStore(RealStore):
 
 if MARKER and POINT != 'worker':
     b.Store = StandStore
+
+if POINT == 'maintenance':
+    real_save = b.retention.Maintainer.save
+
+    def maintenance_save(owner, result):
+        if owner.kind == 'bridge' and result['counts'].get('jobs', 0):
+            freeze()  # content updated inside the transaction, before maintenance state/COMMIT
+        return real_save(owner, result)
+
+    b.retention.Maintainer.save = maintenance_save
 
 if __name__ == '__main__':
     try:

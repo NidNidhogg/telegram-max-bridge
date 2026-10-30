@@ -320,6 +320,73 @@ for worker in poll:tg send:max poll:max send:tg; do
     ctl d4-recovered "$worker"
 done
 
+step 'D5.2: SIGKILL inside content cleanup; replay and old replies after restart'
+$M COMPOSE="$C" stop-bridge
+ctl d52-seed
+before=$(ctl d3-snapshot)
+$M COMPOSE="$C" maintenance
+[ "$before" = "$(ctl d3-snapshot)" ] || fail 'maintenance dry-run changed the bridge database'
+if $M COMPOSE="$C" maintenance APPLY=1; then fail 'maintenance apply did not respect the running monitor lock'; fi
+[ "$before" = "$(ctl d3-snapshot)" ] || fail 'refused maintenance changed the bridge database'
+arm maintenance:kill
+frozen
+ctl d52-unchanged
+crash
+ctl d52-unchanged
+fresh
+ctl d52-cleaned
+ctl d52-replies
+
+step 'D5.2: SIGTERM during cleanup respects the transaction and shutdown budget'
+$M COMPOSE="$C" stop-bridge
+ctl d52-seed
+arm maintenance:term
+frozen
+started=$(date +%s)
+docker update --restart=no "$(cid)" >/dev/null
+docker kill -s TERM "$(cid)" >/dev/null
+docker kill -s CONT "$(cid)" >/dev/null
+i=0
+while [ $i -lt 35 ]; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] && break
+    i=$((i + 1)); sleep 1
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] || fail 'cleanup SIGTERM exceeded shutdown budget'
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$(cid)")" = 0 ] || fail 'cleanup SIGTERM did not exit cleanly'
+[ $(($(date +%s) - started)) -le 30 ] || fail 'cleanup SIGTERM exceeded 30 seconds'
+ctl d52-atomic
+fresh
+ctl d52-cleaned
+
+for platform in tg max; do
+    step "D5.2: SIGTERM inside $platform batch acceptance; atomic cursor/queue and replay after restart"
+    arm "accept:d52-term-$platform-0"
+    ctl d52-term-start "$platform"
+    frozen
+    ctl d52-term-check "$platform" frozen
+    started=$(date +%s)
+    docker update --restart=no "$(cid)" >/dev/null
+    docker kill -s TERM "$(cid)" >/dev/null
+    docker kill -s CONT "$(cid)" >/dev/null
+    i=0
+    while [ $i -lt 35 ]; do
+        [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] && break
+        i=$((i + 1)); sleep 1
+    done
+    [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] || fail 'intake SIGTERM exceeded shutdown budget'
+    [ "$(docker inspect -f '{{.State.ExitCode}}' "$(cid)")" = 0 ] || fail 'intake SIGTERM did not exit cleanly'
+    [ $(($(date +%s) - started)) -le 30 ] || fail 'intake SIGTERM exceeded 30 seconds'
+    ctl d52-term-check "$platform" stopped
+    fresh
+    ctl d52-term-check "$platform" recovered
+done
+
+step 'D5.2: legacy v3 adoption and alert-history retention through monitor restart'
+ctl d52-compatibility
+
+step 'D5.2: repeated intake/delivery/aging/cleanup cycles on real SQLite files'
+ctl d52-cycles
+
 step 'D5.1: bounded alert JSON files and outbox recovery after a real SIGKILL'
 ctl d5-rotation
 
@@ -358,6 +425,35 @@ set -- $($P run --rm --no-deps -T ctl d5-thresholds)
 export STAND_STORAGE_FREE_WARN_BYTES=$1 STAND_STORAGE_FREE_CRITICAL_BYTES=$2
 keep_logs; $P up -d --force-recreate --no-deps bridge monitor
 $P run --rm --no-deps -T ctl d5-pressure
+
+step 'D5.2: real ENOSPC exactly at final runtime write; truthful failure and recovery'
+$P stop monitor
+$M COMPOSE="$P" stop-bridge
+keep_logs; STAND_FREEZE=stop-full:finish $P up -d --force-recreate --no-deps bridge
+$P run --rm --no-deps -T ctl d52-full-seed
+docker update --restart=no "$(cid)" >/dev/null
+docker kill -s TERM "$(cid)" >/dev/null
+frozen
+$P run --rm --no-deps -T ctl d52-full-fill
+started=$(date +%s)
+docker kill -s CONT "$(cid)" >/dev/null
+i=0
+while [ $i -lt 35 ]; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] && break
+    i=$((i + 1)); sleep 1
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] || fail 'full stop exceeded shutdown budget'
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$(cid)")" = 1 ] || fail 'full stop did not return error code 1'
+[ "$(docker inspect -f '{{.State.OOMKilled}}' "$(cid)")" = false ] || fail 'full stop was killed by OOM'
+[ $(($(date +%s) - started)) -le 30 ] || fail 'full stop exceeded 30 seconds'
+$P logs --no-log-prefix bridge | $P run --rm --no-deps -T ctl d52-full-logs
+$P run --rm --no-deps -T ctl d52-full-release
+keep_logs; $P up -d --force-recreate --no-deps bridge
+set -- $($P run --rm --no-deps -T ctl d52-full-restarted)
+$M COMPOSE="$P" stop-bridge
+$M COMPOSE="$P" cli ARGS="queue confirm $1 --remote-id $2 --reason 'stand: copy found in target group'"
+$P start bridge
+$P run --rm --no-deps -T ctl d52-full-done
 keep_logs
 $M COMPOSE="$P" down
 unset STAND_STORAGE_FREE_WARN_BYTES STAND_STORAGE_FREE_CRITICAL_BYTES
