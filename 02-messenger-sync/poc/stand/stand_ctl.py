@@ -733,6 +733,19 @@ def step_d52_cycles():
     print('D5 cycles OK: 60 paired cycles, real SQLite/WAL, retained IDs/replies, protected queue and outbox')
 
 
+def step_d52_compatibility():
+    import unittest
+
+    from test_retention import RetentionCompatibilityTests
+
+    class VolumeCompatibilityTests(RetentionCompatibilityTests):
+        STATE_ROOT = STATE
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(VolumeCompatibilityTests))
+    assert result.wasSuccessful(), 'D5 compatibility regression failed'
+    print('D5 compatibility OK: physical legacy v3 adoption, retained IDs/replies, recovery confirmation and durable alert ACK')
+
+
 def step_d52_seed():
     assert not b.bridge_running(STATE), 'stop the bridge before preparing retention fixtures'
     path = STATE / 'stand-d52-fixture.json'

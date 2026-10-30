@@ -481,6 +481,200 @@ class MonitorRetentionTests(unittest.TestCase):
                 owner.db.close()
 
 
+class RetentionCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    STATE_ROOT = None  # Smoke uses a temporary subdirectory of its own persistent volume.
+    NOW = 1700000000.0
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='compat-', dir=self.STATE_ROOT)
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+
+    @staticmethod
+    def rows(db):
+        tables = ('meta', 'inbox', 'jobs', 'quarantine', 'audit')
+        return {table: [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+                for table in tables}
+
+    def monitor(self):
+        owner = b.AlertMonitor(self.state / 'monitor.sqlite3')
+        self.addCleanup(owner.db.close)
+        return owner
+
+    def maintain_monitor(self, owner, now):
+        # Walk past the previous cursor, wrap, and revisit older protected events.
+        # Closing a problem must not depend on where the last maintenance pass stopped.
+        for _ in range(4):
+            result = r.Maintainer(owner.db, 'monitor', r.Settings(budget_ms=200)).run(now=now)
+            self.assertEqual(result['state'], 'ok', result)
+
+    async def test_legacy_v3_adoption_preserves_data_replay_and_reply_links(self):
+        path = self.state / 'bridge.sqlite3'
+        fixture = Path(__file__).with_name('fixtures') / 'bridge-v3-5b04a90.sql'
+        with sqlite3.connect(path) as legacy:
+            self.addCleanup(legacy.close)
+            legacy.executescript(fixture.read_text())
+            before = self.rows(legacy)
+            before_dump = logical(legacy)
+            schema = legacy.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name').fetchall()
+            self.assertEqual(legacy.execute('PRAGMA user_version').fetchone()[0], 3)
+            self.assertEqual(legacy.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+            self.assertEqual(legacy.execute('PRAGMA synchronous').fetchone()[0], 2)
+            self.assertNotIn('jobs_unresolved_retention', {row[1] for row in schema})
+        legacy.close()
+        with b.Store(path, readonly=True) as reader:
+            self.assertEqual(logical(reader.db), before_dump)
+        # Adoption uses a physical v3 file produced by the old code, not a new Store with its index removed.
+        with b.Store(path) as store:
+            self.assertEqual(self.rows(store.db), before)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 3)
+            adopted_schema = [tuple(row) for row in store.db.execute(
+                'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name')]
+            self.assertEqual([row for row in adopted_schema if row[1] != 'jobs_unresolved_retention'], schema)
+            self.assertIn('jobs_unresolved_retention', {row[1] for row in adopted_schema})
+            adopted = logical(store.db)
+        self.assertEqual(list(self.state.glob('*.bak')), [])
+        with b.Store(path) as store:
+            self.assertEqual(logical(store.db), adopted, 'second adoption must be idempotent')
+            guards = {row['id']: dict(row) for row in store.db.execute("SELECT * FROM jobs WHERE state!='sent'")}
+            self.assertEqual(len(guards), 8)
+            result = r.Maintainer(store.db, 'bridge', r.Settings(budget_ms=200)).run(now=self.NOW)
+            self.assertEqual(result['state'], 'ok', result)
+            self.assertEqual(result['counts'], {'jobs': 2, 'quarantine': 0, 'audit': 0})
+            self.assertEqual({row['id']: dict(row) for row in store.db.execute("SELECT * FROM jobs WHERE state!='sent'")}, guards)
+            after = self.rows(store.db)
+            columns = [column[0] for column in store.db.execute('SELECT * FROM jobs LIMIT 0').description]
+            expected_jobs = [tuple(r.CLEARED if columns[i] == 'payload' and row[columns.index('state')] == 'sent' else value
+                                   for i, value in enumerate(row)) for row in before['jobs']]
+            self.assertEqual(after['jobs'], expected_jobs)
+            for table in ('inbox', 'quarantine', 'audit'):
+                self.assertEqual(after[table], before[table])
+            for key, value in before['meta']:
+                self.assertEqual(store.get(key), value)
+            self.assertEqual(store.identity(), {'tg': ('99', '-100'), 'max': ('88', '-200')})
+            with patch.object(b.time, 'time', return_value=self.NOW):
+                for platform, events, cursor, chat, own in (
+                    ('tg', [tg(i, 'replayed') for i in range(1, 6)], 100, '-100', '99'),
+                    ('max', [mx('m' + str(i), 'replayed') for i in range(1, 6)], 'saved-marker', '-200', '88'),
+                ):
+                    store.accept(platform, events, cursor, chat, own)
+                self.assertEqual(self.rows(store.db)['jobs'], after['jobs'], 'old IDs must still deduplicate scrubbed messages')
+                replies = [('tg', 201, 1, 'old-max-1'), ('tg', 202, 1001, 'm1'),
+                           ('max', 'reply-m1', 'm1', '1001'), ('max', 'reply-m2', 'old-max-1', '1')]
+                for platform, mid, parent, expected in replies:
+                    event = tg(mid, 'reply') if platform == 'tg' else mx(mid, 'reply')
+                    if platform == 'tg':
+                        event['message']['reply_to_message'] = {'message_id': parent}
+                    else:
+                        event['message']['link'] = {'type': 'reply', 'message': {'mid': parent}}
+                    store.accept(platform, [event], None, '-100' if platform == 'tg' else '-200',
+                                 '99' if platform == 'tg' else '88')
+                    job = store.db.execute('SELECT * FROM jobs WHERE source=? AND mid=?', (platform, str(mid))).fetchone()
+                    self.assertEqual(store.parent_id(job), expected)
+                api = FakeApi()
+                bridge = b.Bridge({'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}, api, store, {'tg': '99', 'max': '88'})
+                await bridge.deliver('tg')
+                await bridge.deliver('max')
+                self.assertEqual(api.calls, [], 'saved future retries must not publish early')
+                store.recover()
+                for jid, old in guards.items():
+                    current = dict(store.db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone())
+                    if old['state'] == 'sending':
+                        self.assertEqual(current['state'], 'uncertain')
+                        self.assertTrue(current['error'].startswith('interrupted:'))
+                        current.update(state=old['state'], error=old['error'], updated=old['updated'])
+                    self.assertEqual(current, old)
+            final = logical(store.db)
+        with b.Store(path, readonly=True) as reader:
+            self.assertEqual(logical(reader.db), final)
+            self.assertEqual(reader.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_recovery_confirmation_restart_and_ack_survive_retention(self):
+        owner = self.monitor()
+        issue = {'key': 'blocked:max', 'code': 'delivery_blocked'}
+        problem_at, observed_at = self.NOW - 100 * DAY, self.NOW
+
+        def observe(issues, at):
+            owner.observe({'issues': issues, 'platforms': {'tg': {}, 'max': {}}, 'generated_at': at})
+
+        observe([issue], problem_at)
+        emitted = []
+        with patch.object(b.time, 'time', return_value=problem_at):
+            owner.flush(emitted.append)
+        self.assertEqual(len(emitted), 1)
+        problem = tuple(owner.db.execute('SELECT * FROM alerts').fetchone())
+        observe([], observed_at)  # First clean observation; recovery still needs confirmation.
+        state = dict(owner.db.execute('SELECT key,value FROM monitor_state'))
+        self.assertEqual(json.loads(state['absent']), {issue['key']: 1})
+        self.assertIn(issue['key'], json.loads(state['issues']))
+        owner.db.close()
+        owner = self.monitor()
+        self.maintain_monitor(owner, observed_at)
+        self.assertEqual([tuple(row) for row in owner.db.execute('SELECT * FROM alerts')], [problem])
+        self.assertTrue(all(owner.db.execute('SELECT value FROM monitor_state WHERE key=?', (key,)).fetchone()[0] == value
+                            for key, value in state.items()), 'maintenance must not confirm recovery')
+        observe([], observed_at + 1)
+        records = [json.loads(row[0]) for row in owner.db.execute('SELECT payload FROM alerts ORDER BY id')]
+        self.assertEqual([row['kind'] for row in records], ['problem', 'recovery'])
+        recovery = records[1]
+        self.assertNotEqual(recovery['event_id'], emitted[0]['event_id'])
+        self.maintain_monitor(owner, observed_at + 1)
+        self.assertEqual([tuple(row) for row in owner.db.execute('SELECT event_id,delivered FROM alerts')],
+                         [(recovery['event_id'], 0)])
+        attempts = []
+
+        def failed_sink(alert):
+            attempts.append(alert)
+            raise OSError('synthetic sink failure before ACK')
+
+        with self.assertRaises(OSError):
+            owner.flush(failed_sink)
+        self.assertEqual(attempts[0]['event_id'], recovery['event_id'])
+        owner.db.close()
+        owner = self.monitor()
+        self.maintain_monitor(owner, observed_at + 200 * DAY)
+        self.assertEqual(owner.db.execute('SELECT delivered FROM alerts').fetchone()[0], 0)
+        delivered_at = observed_at + 200 * DAY
+        with patch.object(b.time, 'time', return_value=delivered_at):
+            owner.flush(emitted.append)
+        self.assertEqual(emitted[-1]['event_id'], recovery['event_id'], 'retry of the sink keeps event identity')
+        acknowledged = json.loads(owner.db.execute('SELECT payload FROM alerts').fetchone()[0])
+        self.assertEqual(acknowledged['retention_since'], delivered_at)
+        owner.db.close()
+        owner = self.monitor()
+        self.maintain_monitor(owner, delivered_at + 90 * DAY - 1)
+        self.assertEqual(owner.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 1)
+        self.maintain_monitor(owner, delivered_at + 90 * DAY)
+        self.assertEqual(owner.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 0)
+        observe([], delivered_at + 90 * DAY + 1)
+        self.assertEqual(owner.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 0, 'no duplicate recovery')
+        self.assertEqual(owner.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_legacy_absent_only_state_protects_delivered_history_after_restart(self):
+        owner = self.monitor()
+        issue = {'key': 'legacy-absent', 'code': 'delivery_blocked'}
+        payload = {'event_id': 'legacy-delivered', 'kind': 'problem', 'detected_at': self.NOW - 100 * DAY,
+                   'retention_since': self.NOW - 91 * DAY, 'issue': issue}
+        with owner.db:
+            owner.db.execute('INSERT INTO alerts(event_id,payload,delivered) VALUES(?,?,1)',
+                             (payload['event_id'], json.dumps(payload)))
+            owner.db.executemany('INSERT INTO monitor_state VALUES(?,?)',
+                                 [('issues', '{}'), ('absent', json.dumps({issue['key']: 1}))])
+        before = tuple(owner.db.execute('SELECT * FROM alerts').fetchone())
+        owner.db.close()
+        owner = self.monitor()
+        self.maintain_monitor(owner, self.NOW)
+        self.assertEqual([tuple(row) for row in owner.db.execute('SELECT * FROM alerts')], [before])
+        self.assertEqual(json.loads(owner.db.execute("SELECT value FROM monitor_state WHERE key='absent'").fetchone()[0]),
+                         {issue['key']: 1})
+        with owner.db:
+            owner.db.execute("UPDATE monitor_state SET value='{}' WHERE key='absent'")
+        owner.db.close()
+        owner = self.monitor()
+        self.maintain_monitor(owner, self.NOW)
+        self.assertEqual(owner.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 0)
+
+
 class RetentionRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_replies_and_redelivery_both_directions_after_auto_cleanup(self):
         with tempfile.TemporaryDirectory() as directory, b.Store(Path(directory) / 'bridge.sqlite3') as store:

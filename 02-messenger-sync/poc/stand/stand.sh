@@ -381,6 +381,9 @@ for platform in tg max; do
     ctl d52-term-check "$platform" recovered
 done
 
+step 'D5.2: legacy v3 adoption and alert-history retention through monitor restart'
+ctl d52-compatibility
+
 step 'D5.2: repeated intake/delivery/aging/cleanup cycles on real SQLite files'
 ctl d52-cycles
 
