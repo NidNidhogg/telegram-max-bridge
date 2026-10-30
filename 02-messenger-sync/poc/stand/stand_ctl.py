@@ -809,5 +809,152 @@ def step_d52_replies():
     print('D5.2 replies OK: old mirrored messages map both ways; identical texts stay separate')
 
 
+def stop_batch(platform):
+    mids = list(range(5001, 5005)) if platform == 'tg' else ['stop-m1', 'stop-m2', 'stop-m3', 'stop-m4']
+    event = tg_event if platform == 'tg' else max_event
+    events = [event(mid, f'd52-term-{platform}-{i}') for i, mid in enumerate(mids)]
+    events[1] = event(mids[1], long_text(f'd52-term-{platform}-long'))
+    if platform == 'tg':
+        events[2]['message'].pop('text')
+        events[2]['message']['photo'] = [{'file_size': 1}]
+    else:
+        events[2]['message']['body']['attachments'] = [{'type': 'image', 'payload': {}}]
+    return mids, events
+
+
+def stop_batch_state(platform):
+    with db() as conn:
+        return {'cursor': meta('cursor_' + platform),
+                'jobs': conn.execute('SELECT count(*) FROM jobs').fetchone()[0],
+                'inbox': conn.execute('SELECT count(*) FROM inbox').fetchone()[0],
+                'quarantine': quarantined(), 'publications': total_pubs()}
+
+
+def step_d52_term_start(platform):
+    mids, events = stop_batch(platform)
+    path = STATE / f'stand-stop-{platform}.json'
+    with path.open('x') as stream:
+        json.dump(stop_batch_state(platform), stream)
+    call('inject_many', platform=platform, events=events)
+
+
+def step_d52_term_check(platform, stage):
+    before = json.loads((STATE / f'stand-stop-{platform}.json').read_text())
+    mids, _ = stop_batch(platform)
+    rows = [parts(platform, m) for m in mids]
+    if stage == 'frozen':
+        assert stop_batch_state(platform) == before
+        assert not any(rows)
+    elif stage == 'stopped':
+        after = stop_batch_state(platform)
+        committed = bool(rows[0])
+        delta = 1 if committed else 0
+        assert [len(r) for r in rows] == ([1, 2, 0, 1] if committed else [0] * 4)
+        assert all(r['state'] == 'pending' for group in rows for r in group)
+        assert after['jobs'] == before['jobs'] + 4 * delta
+        assert after['inbox'] == before['inbox'] + 3 * delta
+        assert after['quarantine'] == before['quarantine'] + delta
+        expected_cursor = '5005' if platform == 'tg' else str(int(before['cursor']) + 4)
+        assert after['cursor'] == (expected_cursor if committed else before['cursor'])
+        assert after['publications'] == before['publications']
+        assert meta('runtime_state') == 'stopped'
+    else:
+        call('replay', platform=platform)
+        until(lambda: all(parts(platform, m) and all(r['state'] == 'sent' for r in parts(platform, m))
+                          for m in (mids[0], mids[1], mids[3])), 'TERM batch recovery')
+        polls = call('state')['polls'][platform]
+        call('replay', platform=platform)
+        until(lambda: call('state')['polls'][platform] >= polls + 3, 'second TERM replay')
+        after = stop_batch_state(platform)
+        assert [len(parts(platform, m)) for m in mids] == [1, 2, 0, 1]
+        assert after['jobs'] == before['jobs'] + 4 and after['inbox'] == before['inbox'] + 3
+        assert after['quarantine'] == before['quarantine'] + 1
+        assert after['publications'] == before['publications'] + 4
+        order(f'd52-term-{platform}-0', f'd52-term-{platform}-long', f'd52-term-{platform}-3')
+    print(f'D5 SIGTERM intake {platform} {stage} OK')
+
+
+def step_d52_full_seed():
+    call('max_publish', mode='error_after')
+    inject('tg', tg_event(9301, 'd52-full-uncertain'))
+    until(lambda: parts('tg', 9301) and job('tg', 9301)['state'] == 'uncertain', 'uncertain before full stop')
+    call('max_publish', mode='ok')
+    inject('tg', tg_event(9302, 'd52-full-pending', reply_to=9301))
+    until(lambda: parts('tg', 9302), 'pending before full stop')
+    assert job('tg', 9302)['state'] == 'pending'
+    assert len(pubs('d52-full-uncertain')) == 1 and not pubs('d52-full-pending')
+    print('D5 full stop seeded: unresolved publication and dependent pending reply')
+
+
+def step_d52_full_fill():
+    import errno
+    disk = os.statvfs(STATE)
+    assert disk.f_blocks * disk.f_frsize == 128 * 1024**2, 'refuse to fill an unbounded state volume'
+    path = STATE / 'd52-stop-owned-pressure.bin'
+    expected = STATE / 'stand-stop-full-expected.json'
+    data = json.loads(expected.read_text())
+    with path.open('xb', buffering=0) as stream:
+        info = os.fstat(stream.fileno())
+        data.update(device=info.st_dev, inode=info.st_ino)
+        with expected.open('w') as output:
+            json.dump(data, output)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            while True:
+                stream.write(b'x' * 1024**2)
+        except OSError as exc:
+            assert exc.errno == errno.ENOSPC, exc
+        os.fsync(stream.fileno())
+    assert os.statvfs(STATE).f_bavail * disk.f_frsize < 4096
+    print('D5 full stop: bounded state volume really exhausted; only stand-owned file allocated')
+
+
+def step_d52_full_release():
+    import stat
+    expected = json.loads((STATE / 'stand-stop-full-expected.json').read_text())
+    path = STATE / 'd52-stop-owned-pressure.bin'
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    assert (info.st_dev, info.st_ino) == (expected['device'], expected['inode'])
+    with b.process_lock(STATE):
+        path.unlink()
+        assert logical_snapshot(STATE / 'bridge.sqlite3') == expected['snapshot'], 'failed final transaction changed data'
+        with db() as conn:
+            assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+    assert meta('runtime_state') == 'running', 'failed final write must not persist stopped'
+    view, issues = health_issues()
+    assert any(i['code'] == 'process_stopped' for i in issues), view
+    assert not any(i['code'] == 'state_unavailable' for i in issues), view
+    assert job('tg', 9301)['state'] == 'uncertain' and job('tg', 9302)['state'] == 'pending'
+    print('D5 full stop: lock released, transaction rolled back, integrity/queue/cursor preserved, health sees stopped process')
+
+
+def step_d52_full_logs():
+    lines = sys.stdin.read().splitlines()
+    assert 'stand: final runtime write raised SQLITE_FULL' in lines
+    records = [json.loads(line) for line in lines if line.startswith('{')]
+    assert any(r['event'] == 'stopped_with_error' and r.get('error_code') == 'storage_error' for r in records)
+    assert not any(r['event'] == 'bridge_stopped' for r in records), 'false successful shutdown'
+    print('D5 full stop logs OK: real SQLITE_FULL, sanitized storage_error, no successful shutdown')
+
+
+def step_d52_full_restarted():
+    polls = call('state')['polls']['tg']
+    call('replay', platform='tg')
+    until(lambda: call('state')['polls']['tg'] >= polls + 3, 'polling after free space and restart')
+    assert job('tg', 9301)['state'] == 'uncertain' and job('tg', 9302)['state'] == 'pending'
+    assert len(pubs('d52-full-uncertain')) == 1 and not pubs('d52-full-pending')
+    print(job('tg', 9301)['id'], pub('d52-full-uncertain')['remote_id'])
+
+
+def step_d52_full_done():
+    until(lambda: pubs('d52-full-pending'), 'pending reply after explicit confirmation')
+    assert job('tg', 9301)['state'] == job('tg', 9302)['state'] == 'sent'
+    assert len(pubs('d52-full-uncertain')) == 1
+    assert pub('d52-full-pending')['reply'] == pub('d52-full-uncertain')['remote_id']
+    print('D5 full stop recovery OK: no uncertain retry; confirmed copy restores dependent reply exactly once')
+
+
 if __name__ == '__main__':
     globals()['step_' + sys.argv[1].replace('-', '_')](*sys.argv[2:])

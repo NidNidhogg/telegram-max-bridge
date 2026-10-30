@@ -23,6 +23,123 @@ def logical(db):
     return tuple(db.iterdump())
 
 
+class ShutdownTests(unittest.TestCase):
+    PROBE = '''import asyncio,json,os,signal,sqlite3,sys
+from pathlib import Path
+import bridge as b
+from test_bridge import tg,mx
+mode,platform,directory=sys.argv[1:]
+state=Path(directory);signalled=False;inside=False;before={};late=[];posts=[];once=False
+keys=('runtime_state','heartbeat','run_started','run_stopped','run_id')
+def snapshot(store):
+ return {'meta':{k:store.get(k) for k in keys},'jobs':[tuple(r) for r in store.db.execute('SELECT * FROM jobs ORDER BY id')]}
+class StopStore(b.Store):
+ def accept_one(self,source,event,chat_id,own_id):
+  global signalled,inside
+  super().accept_one(source,event,chat_id,own_id)
+  if mode=='accept' and source==platform and not signalled:
+   inside=self.db.in_transaction;signalled=True;os.kill(os.getpid(),signal.SIGTERM)
+ def runtime(self,status,run_id=None):
+  global before,signalled
+  if mode=='full' and status=='stopped':
+   before=snapshot(self)
+   self.db.executescript("""CREATE TABLE stop_full_space(data BLOB);
+    CREATE TRIGGER stop_full BEFORE INSERT ON meta WHEN NEW.key='run_stopped'
+    BEGIN INSERT INTO stop_full_space VALUES(zeroblob(1048576)); END;""")
+   pages=self.db.execute('PRAGMA page_count').fetchone()[0]
+   self.db.execute(f'PRAGMA max_page_count={pages+1}')
+  super().runtime(status,run_id)
+  if mode=='full' and status=='running':
+   signalled=True;os.kill(os.getpid(),signal.SIGTERM)
+class Api:
+ async def request(self,service,path,**kwargs):
+  global once
+  if signalled:late.append([service,path])
+  if path in ('getUpdates','/updates'):
+   events=[]
+   if mode=='accept' and service==platform and not once:
+    once=True;events=[tg(1,'first'),tg(2,'🌿'*2000)] if service=='tg' else [mx('m1','first'),mx('m2','🌿'*2000)]
+   return events if service=='tg' else {'updates':events,'marker':'accept-end'}
+  posts.append([service,path]);return {'message_id':10000} if service=='tg' else {'message':{'body':{'mid':'copy'}}}
+b.RUN['component']='bridge';exit_code=0;failure=None
+previous={s:signal.getsignal(s) for s in (signal.SIGTERM,signal.SIGINT)}
+with b.process_lock(state):
+ with StopStore(state/'bridge.sqlite3') as store:
+  if mode=='full':
+   store.accept('tg',[tg(1),tg(2)],3,'-100','99');store.update(1,'uncertain')
+  bridge=b.Bridge({'TG_CHAT_ID':'-100','MAX_CHAT_ID':'-200'},Api(),store,{'tg':'99','max':'88'},send_intervals={'tg':0,'max':0})
+  async def run():
+   loop=asyncio.get_running_loop();original=loop.create_future
+   def create_future():
+    global once,signalled
+    if not once:
+     once=True;signalled=True;os.kill(os.getpid(),signal.SIGTERM)
+    return original()
+   if mode=='wait':loop.create_future=create_future
+   try:await b.run_bridge(bridge,poll_interval=0.01,delivery_interval=0.01,heartbeat_interval=0.01)
+   finally:loop.create_future=original
+  try:asyncio.run(run())
+  except sqlite3.OperationalError as exc:
+   failure=getattr(exc,'sqlite_errorcode',None);exit_code=b.report_failure(exc)
+  result={'inside':inside,'late':late,'posts':posts,'error':failure,'before':before,'after':snapshot(store),
+          'cursor':store.get('cursor_'+platform),'inbox':store.db.execute('SELECT count(*) FROM inbox').fetchone()[0],
+          'states':[r[0] for r in store.db.execute('SELECT state FROM jobs ORDER BY id')],
+          'signals_restored':all(signal.getsignal(s)==h for s,h in previous.items())}
+with b.process_lock(state):result['lock_released']=True
+with b.Store(state/'bridge.sqlite3',readonly=True) as check:result['integrity']=check.db.execute('PRAGMA integrity_check').fetchone()[0]
+print('SHUTDOWN_RESULT '+json.dumps(result));sys.exit(exit_code)
+'''
+
+    def probe(self, mode, platform):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, '-c', self.PROBE, mode, platform, directory],
+                                    cwd=Path(__file__).parent, capture_output=True, text=True, timeout=10)
+            lines = [line for line in result.stdout.splitlines() if line.startswith('SHUTDOWN_RESULT ')]
+            self.assertEqual(len(lines), 1, result.stderr[-1500:])
+            data = json.loads(lines[0].partition(' ')[2])
+            self.assertTrue(data['lock_released'])
+            self.assertTrue(data['signals_restored'])
+            self.assertEqual(data['integrity'], 'ok')
+            with b.process_lock(Path(directory)):
+                pass
+            return result, data
+
+    def check_accept(self, platform):
+        result, data = self.probe('accept', platform)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(data['inside'])
+        self.assertEqual(data['late'], [], 'API operations started after SIGTERM inside the transaction')
+        self.assertEqual(data['posts'], [])
+        self.assertIn(len(data['states']), (0, 3))
+        self.assertTrue(all(state == 'pending' for state in data['states']))
+        self.assertEqual(data['inbox'], 2 if data['states'] else 0)
+        self.assertEqual(data['cursor'], ('3' if platform == 'tg' else 'accept-end') if data['states'] else None)
+        self.assertEqual(data['after']['meta']['runtime_state'], 'stopped')
+
+    def test_sigterm_inside_telegram_accept_is_atomic_and_starts_no_api(self):
+        self.check_accept('tg')
+
+    def test_sigterm_inside_max_accept_is_atomic_and_starts_no_api(self):
+        self.check_accept('max')
+
+    def test_sigterm_while_arming_stop_waiter_is_not_lost(self):
+        result, data = self.probe('wait', 'tg')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(data['late'], [])
+        self.assertEqual(data['after']['meta']['runtime_state'], 'stopped')
+
+    def test_full_final_runtime_write_rolls_back_and_reports_error(self):
+        result, data = self.probe('full', 'tg')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(data['error'], sqlite3.SQLITE_FULL)
+        self.assertEqual(data['before'], data['after'])
+        self.assertEqual(data['states'], ['uncertain', 'pending'])
+        self.assertEqual(data['after']['meta']['runtime_state'], 'running')
+        errors = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        self.assertTrue(any(row.get('event') == 'stopped_with_error' and row.get('error_code') == 'storage_error' for row in errors))
+        self.assertNotIn('bridge_stopped', result.stdout)
+
+
 class RetentionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

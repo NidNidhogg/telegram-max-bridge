@@ -1022,8 +1022,14 @@ class Bridge:
 async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.2,
                      heartbeat_interval=2, shutdown_timeout=30):
     """One owner per poller/sender; expected service failures stay in that worker."""
+    class ShutdownEvent(asyncio.Event):
+        requested = False
+
+        def is_set(self):
+            return self.requested or super().is_set()
+
     install_signals = stop is None
-    stop = stop if stop is not None else asyncio.Event()
+    stop = stop if stop is not None else ShutdownEvent()
     loop = asyncio.get_running_loop()
 
     async def wait(delay):
@@ -1098,9 +1104,17 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                 log('warning', 'maintenance_deferred', error_code='storage_error')
             await wait(owner.policy.interval)
 
+    previous_signals = {}
+
+    def stopping(signum, frame):
+        # Latch synchronously so ready workers see the signal immediately. Notify waiters
+        # through the loop: Event.set inside a signal handler can race with Event.wait.
+        stop.requested = True
+        loop.call_soon_threadsafe(stop.set)
+
     if install_signals:
         for signum in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(signum, stop.set)
+            previous_signals[signum] = signal.signal(signum, stopping)
     RUN['id'] = RUN['id'] or secrets.token_hex(8)
     try:
         bridge.store.runtime('running', RUN['id'])
@@ -1122,9 +1136,8 @@ async def run_bridge(bridge, stop=None, *, poll_interval=1, delivery_interval=0.
                 error = error.exceptions[0]
             raise error from None
     finally:
-        if install_signals:
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                loop.remove_signal_handler(signum)
+        for signum, handler in previous_signals.items():
+            signal.signal(signum, handler)
         bridge.store.runtime('stopped', RUN['id'])
 
 

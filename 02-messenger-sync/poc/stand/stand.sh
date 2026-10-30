@@ -358,6 +358,29 @@ ctl d52-atomic
 fresh
 ctl d52-cleaned
 
+for platform in tg max; do
+    step "D5.2: SIGTERM inside $platform batch acceptance; atomic cursor/queue and replay after restart"
+    arm "accept:d52-term-$platform-0"
+    ctl d52-term-start "$platform"
+    frozen
+    ctl d52-term-check "$platform" frozen
+    started=$(date +%s)
+    docker update --restart=no "$(cid)" >/dev/null
+    docker kill -s TERM "$(cid)" >/dev/null
+    docker kill -s CONT "$(cid)" >/dev/null
+    i=0
+    while [ $i -lt 35 ]; do
+        [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] && break
+        i=$((i + 1)); sleep 1
+    done
+    [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] || fail 'intake SIGTERM exceeded shutdown budget'
+    [ "$(docker inspect -f '{{.State.ExitCode}}' "$(cid)")" = 0 ] || fail 'intake SIGTERM did not exit cleanly'
+    [ $(($(date +%s) - started)) -le 30 ] || fail 'intake SIGTERM exceeded 30 seconds'
+    ctl d52-term-check "$platform" stopped
+    fresh
+    ctl d52-term-check "$platform" recovered
+done
+
 step 'D5.2: repeated intake/delivery/aging/cleanup cycles on real SQLite files'
 ctl d52-cycles
 
@@ -399,6 +422,35 @@ set -- $($P run --rm --no-deps -T ctl d5-thresholds)
 export STAND_STORAGE_FREE_WARN_BYTES=$1 STAND_STORAGE_FREE_CRITICAL_BYTES=$2
 keep_logs; $P up -d --force-recreate --no-deps bridge monitor
 $P run --rm --no-deps -T ctl d5-pressure
+
+step 'D5.2: real ENOSPC exactly at final runtime write; truthful failure and recovery'
+$P stop monitor
+$M COMPOSE="$P" stop-bridge
+keep_logs; STAND_FREEZE=stop-full:finish $P up -d --force-recreate --no-deps bridge
+$P run --rm --no-deps -T ctl d52-full-seed
+docker update --restart=no "$(cid)" >/dev/null
+docker kill -s TERM "$(cid)" >/dev/null
+frozen
+$P run --rm --no-deps -T ctl d52-full-fill
+started=$(date +%s)
+docker kill -s CONT "$(cid)" >/dev/null
+i=0
+while [ $i -lt 35 ]; do
+    [ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] && break
+    i=$((i + 1)); sleep 1
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$(cid)")" = false ] || fail 'full stop exceeded shutdown budget'
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$(cid)")" = 1 ] || fail 'full stop did not return error code 1'
+[ "$(docker inspect -f '{{.State.OOMKilled}}' "$(cid)")" = false ] || fail 'full stop was killed by OOM'
+[ $(($(date +%s) - started)) -le 30 ] || fail 'full stop exceeded 30 seconds'
+$P logs --no-log-prefix bridge | $P run --rm --no-deps -T ctl d52-full-logs
+$P run --rm --no-deps -T ctl d52-full-release
+keep_logs; $P up -d --force-recreate --no-deps bridge
+set -- $($P run --rm --no-deps -T ctl d52-full-restarted)
+$M COMPOSE="$P" stop-bridge
+$M COMPOSE="$P" cli ARGS="queue confirm $1 --remote-id $2 --reason 'stand: copy found in target group'"
+$P start bridge
+$P run --rm --no-deps -T ctl d52-full-done
 keep_logs
 $M COMPOSE="$P" down
 unset STAND_STORAGE_FREE_WARN_BYTES STAND_STORAGE_FREE_CRITICAL_BYTES
