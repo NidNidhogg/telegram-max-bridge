@@ -719,6 +719,20 @@ def step_d5_rotation():
     print('D5 rotation OK: bounded JSON files, expiration, safe paths, partial-line repair, durable outbox and real SIGKILL')
 
 
+def step_d52_cycles():
+    # Same real-SQLite cycle scenario as make test, repeated by the isolated Docker smoke.
+    import unittest
+
+    from test_retention import RetentionCycleTests
+
+    class VolumeCycleTests(RetentionCycleTests):
+        STATE_ROOT = STATE
+
+    result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(VolumeCycleTests))
+    assert result.wasSuccessful(), 'D5 cycle regression failed'
+    print('D5 cycles OK: 60 paired cycles, real SQLite/WAL, retained IDs/replies, protected queue and outbox')
+
+
 def step_d52_seed():
     assert not b.bridge_running(STATE), 'stop the bridge before preparing retention fixtures'
     path = STATE / 'stand-d52-fixture.json'

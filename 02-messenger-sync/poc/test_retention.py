@@ -417,5 +417,268 @@ class RetentionRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
 
+class CycleApi:
+    """Deterministic API boundary; all bridge/SQLite/retention code stays real."""
+    def __init__(self):
+        self.queued = {'tg': [], 'max': []}
+        self.marker = None
+        self.next_id = {'tg': 1000000, 'max': 0}
+        self.posts, self.photos = [], []
+
+    def queue(self, platform, events, marker=None):
+        self.queued[platform] = list(events)
+        if platform == 'max':
+            self.marker = marker if marker is not None else events[-1]['message']['body']['mid']
+
+    async def request(self, platform, path, **kwargs):
+        await asyncio.sleep(0)
+        if path in ('getUpdates', '/updates'):
+            events, self.queued[platform] = self.queued[platform], []
+            return events if platform == 'tg' else {'updates': events, 'marker': self.marker}
+        if path not in ('sendMessage', 'sendPhoto', '/messages'):
+            raise AssertionError('Unexpected API operation in cycle fixture')
+        self.next_id[platform] += 1
+        remote = self.next_id[platform] if platform == 'tg' else f'copy-max-{self.next_id[platform]}'
+        body = kwargs.get('body', {})
+        parent = (body.get('reply_parameters', {}).get('message_id') if platform == 'tg'
+                  else body.get('link', {}).get('mid'))
+        self.posts.append({'platform': platform, 'parent': str(parent) if parent is not None else None,
+                           'remote_id': str(remote), 'photo': path == 'sendPhoto' or bool(body.get('attachments'))})
+        return {'message_id': remote} if platform == 'tg' else {'message': {'body': {'mid': remote}}}
+
+    async def prepare_photo(self, source, reference, destination):
+        self.photos.append((source, reference, destination))
+        await asyncio.sleep(0)
+        return (b'\xff\xd8\xffcycle-photo', 'image/jpeg', 'cycle.jpg') if destination == 'tg' else {'token': reference}
+
+
+class RetentionCycleTests(unittest.IsolatedAsyncioTestCase):
+    CYCLES = 60
+    STEP_DAYS = 7
+    STATE_ROOT = None  # Smoke overrides this with its owned volume; make test uses /tmp.
+    PARTS_PER_CYCLE = 22  # 16 ordinary inputs (two split in two) + four single-part replies.
+    JOB_FIELDS = 'id,source,chat,mid,destination,part,parent,state,remote_id,attempts,ready,error,created,updated'
+
+    def metadata(self, store):
+        return {'jobs': [tuple(row) for row in store.db.execute(f'SELECT {self.JOB_FIELDS} FROM jobs ORDER BY id')],
+                'inbox': [tuple(row) for row in store.db.execute('SELECT * FROM inbox ORDER BY platform,chat,mid')],
+                'identity': store.get('identity'), 'cursor_tg': store.get('cursor_tg'), 'cursor_max': store.get('cursor_max')}
+
+    def measure(self, state, store, monitor, policy):
+        disk = b.storage.snapshot(state, policy)
+        self.assertEqual(disk['state'], 'ok')
+        files = disk['files']
+        rows = store.db.execute("SELECT count(*),coalesce(sum(length(CAST(payload AS BLOB))),0) FROM jobs WHERE state IN ('sent','skipped') AND payload!=?",
+                                (r.CLEARED,)).fetchone()
+        metadata = self.metadata(store)
+        return {'messages': len(metadata['inbox']), 'parts': len(metadata['jobs']),
+                'live_parts': rows[0], 'payload_bytes': rows[1],
+                'metadata_bytes': len(json.dumps(metadata, ensure_ascii=False, separators=(',', ':')).encode()),
+                'bridge_db': files['bridge.sqlite3'], 'bridge_wal': files['bridge.sqlite3-wal'],
+                'bridge_free_pages': r.metrics(store.db)['reusable_pages'],
+                'monitor_db': files['monitor.sqlite3'], 'monitor_wal': files['monitor.sqlite3-wal'],
+                'monitor_free_pages': r.metrics(monitor.db)['reusable_pages'],
+                'alerts_bytes': sum(size for name, size in files.items() if name.startswith('alerts.jsonl')),
+                'managed_bytes': disk['managed_bytes'], 'free_bytes': disk['free_bytes']}
+
+    def sweep(self, owner, now):
+        tables = ('jobs', 'quarantine', 'audit') if owner.kind == 'bridge' else ('alerts',)
+        largest = max(owner.db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] for table in tables)
+        # Two bounded sweeps cover a starting cursor in the middle of an existing page.
+        for _ in range(2 * ((largest + owner.policy.batch_size - 1) // owner.policy.batch_size + 1)):
+            report = owner.run(now=now)
+            self.assertEqual((report['state'], report['reason']), ('ok', None))
+
+    async def drain(self, bridge, api, count):
+        before = len(api.posts)
+        for _ in range(count + 1):
+            await bridge.deliver('tg')
+            await bridge.deliver('max')
+            if len(api.posts) == before + count:
+                break
+        self.assertEqual(len(api.posts), before + count)
+        self.assertEqual(bridge.store.db.execute("SELECT count(*) FROM jobs WHERE state!='sent'").fetchone()[0], 0)
+
+    async def exercise(self, enabled, start):
+        with tempfile.TemporaryDirectory(dir=self.STATE_ROOT) as directory:
+            state, now = Path(directory), [start]
+            policy = b.storage.Settings(free_warn_bytes=2, free_critical_bytes=1,
+                                        alerts_max_bytes=2048, alerts_backup_count=2)
+            store, monitor = b.Store(state / 'bridge.sqlite3'), b.AlertMonitor(state / 'monitor.sqlite3')
+            api = CycleApi()
+            bridge = b.Bridge({'TG_CHAT_ID': '-100', 'MAX_CHAT_ID': '-200'}, api, store,
+                              {'tg': '99', 'max': '88'}, send_intervals={'tg': 0, 'max': 0})
+            owner = r.Maintainer(store.db, 'bridge', r.Settings(content_enabled=int(enabled)))
+            history = r.Maintainer(monitor.db, 'monitor', owner.policy)
+            sink = b.storage.AlertFile(state / 'alerts.jsonl', policy)
+            sequence, first, first_events = {'tg': 0, 'max': 0}, {}, {}
+            curve, reused = [], 0
+
+            def event(platform, text, *, photo=False, parent=None):
+                sequence[platform] += 1
+                mid = sequence[platform]
+                value = tg(mid, text=text) if platform == 'tg' else mx(f'src-max-{mid}', text=text)
+                msg = value['message']
+                if photo:
+                    if platform == 'tg':
+                        del msg['text']
+                        msg.update(caption=text, photo=[{'file_id': f'cycle-{mid}', 'file_size': 16}])
+                    else:
+                        msg['body']['attachments'] = [{'type': 'image', 'payload': {'url': f'https://i.oneme.ru/cycle-{mid}.jpg'}}]
+                if parent is not None:
+                    if platform == 'tg':
+                        msg['reply_to_message'] = {'message_id': int(parent)}
+                    else:
+                        msg['link'] = {'type': 'reply', 'message': {'mid': str(parent)}}
+                return value
+
+            def observation(issues):
+                return {'issues': issues, 'platforms': {'tg': {}, 'max': {}}, 'generated_at': now[0]}
+
+            try:
+                with store.db:
+                    store.set('identity', json.dumps(['99', '88', '-100', '-200']))
+                with patch.object(b.time, 'time', side_effect=lambda: now[0]), redirect_stdout(io.StringIO()):
+                    for cycle in range(1, self.CYCLES + 1):
+                        before = self.measure(state, store, monitor, policy)
+                        batches = {}
+                        for platform in ('tg', 'max'):
+                            bodies = ['plain ASCII ' * 20, 'identical ' * 70, 'identical ' * 70,
+                                      '🌿А' * 1800, 'фото ' + 'я' * 400, 'я' * 2400,
+                                      'mixed English русский ' * 80, f'small {cycle}']
+                            batches[platform] = [event(platform, text, photo=(i == 4)) for i, text in enumerate(bodies)]
+                            api.queue(platform, batches[platform])
+                            await bridge.poll(platform)
+                        await self.drain(bridge, api, self.PARTS_PER_CYCLE - 4)
+                        for platform in ('tg', 'max'):
+                            if platform not in first:
+                                first_events[platform] = batches[platform][0]
+                                first[platform] = dict(store.db.execute('SELECT * FROM jobs WHERE source=? ORDER BY id LIMIT 1', (platform,)).fetchone())
+                            identical_mids = [str(value['message']['message_id']) if platform == 'tg'
+                                              else value['message']['body']['mid'] for value in batches[platform][1:3]]
+                            copies = [store.db.execute('SELECT remote_id FROM jobs WHERE source=? AND mid=?', (platform, mid)).fetchone()[0]
+                                      for mid in identical_mids]
+                            self.assertNotEqual(*copies)
+                        replies = {
+                            'tg': [event('tg', 'reply native', parent=first['tg']['mid']),
+                                   event('tg', 'reply copy', parent=first['max']['remote_id'])],
+                            'max': [event('max', 'reply native', parent=first['max']['mid']),
+                                    event('max', 'reply copy', parent=first['tg']['remote_id'])]}
+                        count = len(api.posts)
+                        for platform in ('tg', 'max'):
+                            api.queue(platform, replies[platform])
+                            await bridge.poll(platform)
+                        await self.drain(bridge, api, 4)
+                        self.assertCountEqual([(post['platform'], post['parent']) for post in api.posts[count:]],
+                                              [('max', first['tg']['remote_id']), ('max', first['max']['mid']),
+                                               ('tg', first['max']['remote_id']), ('tg', first['tg']['mid'])])
+                        delivered = self.measure(state, store, monitor, policy)
+                        reused += delivered['bridge_free_pages'] < before['bridge_free_pages']
+                        metadata = self.metadata(store)
+                        issue = {'key': 'cycle:transient', 'code': 'storage_size', 'severity': 'warning'}
+                        monitor.observe(observation([issue]))
+                        monitor.observe(observation([]))
+                        monitor.observe(observation([]))
+                        self.assertEqual(monitor.flush(sink), 2)
+                        now[0] += self.STEP_DAYS * DAY
+                        self.sweep(owner, now[0])
+                        self.sweep(history, now[0])
+                        sink.maintain()
+                        self.assertEqual(self.metadata(store), metadata)
+                        cleaned = self.measure(state, store, monitor, policy)
+                        expected_live = self.PARTS_PER_CYCLE * (min(cycle, 4) if enabled else cycle)
+                        self.assertEqual(cleaned['live_parts'], expected_live)
+                        self.assertEqual(cleaned['messages'], cycle * 20)
+                        self.assertEqual(cleaned['parts'], cycle * self.PARTS_PER_CYCLE)
+                        self.assertLessEqual(cleaned['alerts_bytes'], policy.alerts_max_bytes * 3)
+                        self.assertEqual(monitor.db.execute('SELECT count(*) FROM alerts WHERE delivered=0').fetchone()[0], 0)
+                        self.assertLessEqual(monitor.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 26)
+                        for platform in ('tg', 'max'):
+                            payload = store.db.execute('SELECT payload FROM jobs WHERE id=?', (first[platform]['id'],)).fetchone()[0]
+                            self.assertEqual(payload == r.CLEARED, bool(enabled and cycle >= 5))
+                            api.queue(platform, [first_events[platform], *replies[platform]], marker=store.get('cursor_max'))
+                            await bridge.poll(platform)
+                        old_posts = len(api.posts)
+                        await bridge.deliver('tg')
+                        await bridge.deliver('max')
+                        self.assertEqual(len(api.posts), old_posts)
+                        self.assertEqual(self.metadata(store), metadata)
+                        self.assertEqual(len(api.posts), cycle * self.PARTS_PER_CYCLE)
+                        curve.append({'cycle': cycle, 'arrival': before, 'delivered': delivered, 'cleaned': cleaned})
+
+                    # Keep real unresolved queue states and an undelivered outbox across further sweeps.
+                    for platform in ('tg', 'max'):
+                        values = [event(platform, 'protected cycle fixture') for _ in range(4)]
+                        api.queue(platform, values)
+                        await bridge.poll(platform)
+                        with store.db:
+                            for value, status in zip(values, ('pending', 'sending', 'failed', 'uncertain')):
+                                mid = str(value['message']['message_id']) if platform == 'tg' else value['message']['body']['mid']
+                                store.db.execute('UPDATE jobs SET state=?,created=?,updated=?,ready=? WHERE source=? AND mid=?',
+                                                 (status, now[0] - 101 * DAY, now[0] - 100 * DAY, now[0] + DAY, platform, mid))
+                    protected = [tuple(row) for row in store.db.execute("SELECT * FROM jobs WHERE state!='sent' ORDER BY id")]
+                    monitor.observe(observation([{'key': 'cycle:open', 'code': 'storage_free'}]))
+                    monitor.flush(sink)
+                    with monitor.db:
+                        monitor.alert('problem', now[0], {'key': 'cycle:undelivered', 'code': 'storage_free'})
+                    protected_alerts = [tuple(row) for row in monitor.db.execute('SELECT * FROM alerts ORDER BY id DESC LIMIT 2')]
+                    metadata = self.metadata(store)
+                    now[0] += 200 * DAY
+                    self.sweep(owner, now[0])
+                    self.sweep(history, now[0])
+                    sink.maintain()
+                    self.assertEqual([tuple(row) for row in store.db.execute("SELECT * FROM jobs WHERE state!='sent' ORDER BY id")], protected)
+                    self.assertEqual([tuple(row) for row in monitor.db.execute('SELECT * FROM alerts ORDER BY id DESC LIMIT 2')], protected_alerts)
+                    self.assertEqual(monitor.db.execute('SELECT count(*) FROM alerts').fetchone()[0], 2)
+                    self.assertEqual(self.metadata(store), metadata)
+                    final = self.measure(state, store, monitor, policy)
+                    self.assertEqual(final['live_parts'], 0 if enabled else self.CYCLES * self.PARTS_PER_CYCLE)
+                    self.assertEqual(len(api.posts), self.CYCLES * self.PARTS_PER_CYCLE)
+                    self.assertEqual(len(api.photos), self.CYCLES * 2)
+                    self.assertEqual(len({(post['platform'], post['remote_id']) for post in api.posts}), len(api.posts))
+                    if enabled:
+                        self.assertGreater(reused, 0)
+                    peak_wal = {key: max(point[stage][key] for point in curve for stage in ('arrival', 'delivered', 'cleaned'))
+                                for key in ('bridge_wal', 'monitor_wal')}
+                    # Scenario bound (small batches, default automatic checkpoints), not a production quota.
+                    self.assertLessEqual(max(peak_wal.values()), 8 * 1024**2)
+                    store.db.close()
+                    monitor.db.close()
+                    with (patch.object(b, 'ENV', state / 'absent.env'),
+                          patch.dict(os.environ, {'RETENTION_CONTENT_ENABLED': str(int(enabled)),
+                                                'STORAGE_FREE_WARN_BYTES': '2', 'STORAGE_FREE_CRITICAL_BYTES': '1'})):
+                        self.assertEqual(b.main(['maintenance', '--apply', '--compact', '--state-dir', str(state)]), 0)
+                    with b.Store(state / 'bridge.sqlite3') as reopened:
+                        self.assertEqual(self.metadata(reopened), metadata)
+                        self.assertEqual(reopened.db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+                    with sqlite3.connect(state / 'monitor.sqlite3') as reopened:
+                        self.assertEqual(reopened.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+                    files = b.storage.snapshot(state, policy)['files']
+                    return {'enabled': enabled, 'storage': 'stand-volume' if self.STATE_ROOT else 'temporary-directory',
+                            'cycles': self.CYCLES, 'delivered_messages': self.CYCLES * 20,
+                            'publications': len(api.posts), 'protected_jobs': len(protected), 'reused_cycles': reused,
+                            'peak_wal': peak_wal, 'final': final,
+                            'compacted_bytes': sum(files.values()), 'curve': curve}
+            finally:
+                store.db.close()
+                monitor.db.close()
+
+    async def test_many_cycles_preserve_delivery_and_reuse_storage(self):
+        start = 1800000000.0  # Logical time only: no real waiting for 30/90 days.
+        cleaned = await self.exercise(True, start)
+        control = await self.exercise(False, start)
+        self.assertEqual(cleaned['final']['metadata_bytes'], control['final']['metadata_bytes'])
+        self.assertEqual(cleaned['final']['parts'], control['final']['parts'])
+        self.assertEqual(cleaned['final']['messages'], control['final']['messages'])
+        self.assertEqual(cleaned['final']['payload_bytes'], 0)
+        self.assertGreater(control['final']['payload_bytes'], 0)
+        self.assertLess(cleaned['compacted_bytes'], control['compacted_bytes'])
+        report = {}
+        for name, result in (('cleaned', cleaned), ('control', control)):
+            report[name] = {key: value for key, value in result.items() if key != 'curve'}
+            report[name]['samples'] = [point for point in result['curve'] if point['cycle'] in (1, 30, 60)]
+        print('D5 cycles measurements: ' + json.dumps(report, sort_keys=True))
+
+
 if __name__ == '__main__':
     unittest.main()

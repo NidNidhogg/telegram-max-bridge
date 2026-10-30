@@ -358,6 +358,9 @@ ctl d52-atomic
 fresh
 ctl d52-cleaned
 
+step 'D5.2: repeated intake/delivery/aging/cleanup cycles on real SQLite files'
+ctl d52-cycles
+
 step 'D5.1: bounded alert JSON files and outbox recovery after a real SIGKILL'
 ctl d5-rotation
 
